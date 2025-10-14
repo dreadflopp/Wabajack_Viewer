@@ -58,32 +58,52 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
+    permissions:
+      contents: write
     
     steps:
     - name: Download all artifacts
       uses: actions/download-artifact@v3
     
-    - name: Create Release Assets
+    - name: Prepare Release Assets
       run: |
         mkdir -p release-assets
-        find . -name "*.exe" -exec cp {} release-assets/ \;
-        find . -name "WabbajackViewer" -not -path "*/release-assets/*" -exec cp {} release-assets/ \;
+        # Copy Windows executables
+        find . -name "WabbajackViewer-Windows-*.exe" -exec cp {} release-assets/ \;
+        # Copy Linux executables
+        find . -name "WabbajackViewer-Linux-*" -not -name "*.exe" -exec cp {} release-assets/ \;
+        # Copy macOS executables
+        find . -name "WabbajackViewer-macOS-*" -not -name "*.exe" -exec cp {} release-assets/ \;
+        
+        # Rename files for clarity
         cd release-assets
         for file in *; do
-          if [[ "$file" == *.exe ]]; then
-            mv "$file" "WabbajackViewer-${file#WabbajackViewer-Windows-}.exe"
-          else
-            mv "$file" "WabbajackViewer-${file#WabbajackViewer-}"
+          if [[ "$file" == WabbajackViewer-Windows-* ]]; then
+            new_name="WabbajackViewer-Windows-${file#WabbajackViewer-Windows-}"
+            mv "$file" "$new_name"
+          elif [[ "$file" == WabbajackViewer-Linux-* ]]; then
+            new_name="WabbajackViewer-Linux-${file#WabbajackViewer-Linux-}"
+            mv "$file" "$new_name"
+          elif [[ "$file" == WabbajackViewer-macOS-* ]]; then
+            new_name="WabbajackViewer-macOS-${file#WabbajackViewer-macOS-}"
+            mv "$file" "$new_name"
           fi
         done
+        
+        # Create a zip file with all executables
+        zip -r WabbajackViewer-All-Platforms.zip *
+        
         ls -la
     
     - name: Upload Release Assets
-      uses: actions/upload-release-asset@v1
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release-assets/*.exe
+          release-assets/WabbajackViewer-Linux-*
+          release-assets/WabbajackViewer-macOS-*
+          release-assets/WabbajackViewer-All-Platforms.zip
+        draft: false
+        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./release-assets/
-        asset_name: WabbajackViewer-Executables.zip
-        asset_content_type: application/zip
