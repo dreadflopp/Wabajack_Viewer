@@ -1,0 +1,24 @@
+# Wabbajack Viewer Requirements
+
+# Runtime dependencies (standard library only)
+# This application uses only Python standard library modules for runtime
+# - json (built-in)
+# - os (built-in)
+# - tkinter (built-in with Python)
+# - datetime (built-in)
+# - webbrowser (built-in)
+# - zipfile (built-in)
+# - tempfile (built-in)
+
+# Build dependencies
+pyinstaller>=5.0.0
+
+# Python version requirement
+# This script requires Python 3.6+ for f-string support and other modern features
+
+# Note: tkinter is included with most Python installations
+# If tkinter is not available, install it with:
+# - Ubuntu/Debian: sudo apt-get install python3-tk
+# - CentOS/RHEL: sudo yum install tkinter
+# - macOS: tkinter should be included with Python
+# - Windows: tkinter is included with Python
