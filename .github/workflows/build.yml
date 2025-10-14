@@ -35,21 +35,21 @@ jobs:
     
     - name: Upload Windows executable
       if: matrix.os == 'windows-latest'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: WabbajackViewer-Windows-${{ matrix.python-version }}
         path: dist/WabbajackViewer.exe
     
     - name: Upload Linux executable
       if: matrix.os == 'ubuntu-latest'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: WabbajackViewer-Linux-${{ matrix.python-version }}
         path: dist/WabbajackViewer
     
     - name: Upload macOS executable
       if: matrix.os == 'macos-latest'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: WabbajackViewer-macOS-${{ matrix.python-version }}
         path: dist/WabbajackViewer
@@ -63,7 +63,7 @@ jobs:
     
     steps:
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
     
     - name: Prepare Release Assets
       run: |
