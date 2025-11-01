@@ -102,18 +102,19 @@ class WabbajackGuideApp:
             self.root.title(f"Wabbajack Manual Installation Guide - {self.modlist_data.get('Name', 'Unknown Modlist')}")
         
         # Update modlist info
-        if hasattr(self, 'info_label'):
+        if hasattr(self, 'info_text'):
             if self.modlist_data:
-                info_text = f"""
-Name: {self.modlist_data.get('Name', 'Unknown')}
+                info_text = f"""Name: {self.modlist_data.get('Name', 'Unknown')}
 Author: {self.modlist_data.get('Author', 'Unknown')}
 Version: {self.modlist_data.get('Version', 'Unknown')}
 Game: {self.modlist_data.get('GameType', 'Unknown')}
 Description: {self.modlist_data.get('Description', 'No description available')}
 Wabbajack Version: {self.modlist_data.get('WabbajackVersion', 'Unknown')}
-Total Mods: {len(self.archives)}
-                """
-                self.info_label.config(text=info_text)
+Total Mods: {len(self.archives)}"""
+                self.info_text.config(state=tk.NORMAL)
+                self.info_text.delete(1.0, tk.END)
+                self.info_text.insert(1.0, info_text)
+                self.info_text.config(state=tk.DISABLED)
         
         # Populate mod list
         self.populate_mod_list()
@@ -152,12 +153,12 @@ Total Mods: {len(self.archives)}
         # Configure grid weights for resizable UI
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(2, weight=1)
         
         # Header
         header_frame = ttk.Frame(main_frame)
-        header_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
         self.title_label = ttk.Label(header_frame, text="Wabbajack Manual Installation Guide", font=('Arial', 16, 'bold'))
         self.title_label.pack()
@@ -166,26 +167,30 @@ Total Mods: {len(self.archives)}
         load_button = ttk.Button(header_frame, text="Load Wabbajack File", command=self.load_wabbajack_file)
         load_button.pack(pady=(5, 0))
         
-        # Modlist info
-        info_frame = ttk.LabelFrame(main_frame, text="Modlist Information", padding="10")
-        info_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # Modlist info - compact section with limited height
+        info_frame = ttk.LabelFrame(main_frame, text="Modlist Information", padding="5")
+        info_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        self.info_label = ttk.Label(info_frame, text="No modlist loaded. Click 'Load Wabbajack File' to begin.", justify=tk.LEFT)
-        self.info_label.pack(anchor=tk.W)
+        # Use scrolled text with limited height to prevent it from growing too large
+        self.info_text = scrolledtext.ScrolledText(info_frame, height=4, wrap=tk.WORD, font=('TkDefaultFont', 9))
+        self.info_text.insert(1.0, "No modlist loaded. Click 'Load Wabbajack File' to begin.")
+        self.info_text.config(state=tk.DISABLED)  # Make it read-only
+        self.info_text.pack(fill=tk.BOTH, expand=False)
+        
+        # Create outer PanedWindow for resizable search and mod list/details area
+        outer_paned = ttk.PanedWindow(main_frame, orient=tk.VERTICAL)
+        outer_paned.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Search frame
-        search_frame = ttk.Frame(main_frame)
-        search_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
-        
-        ttk.Label(search_frame, text="Search Mods:").pack(anchor=tk.W)
+        search_frame = ttk.LabelFrame(outer_paned, text="Search Mods", padding="10")
+        ttk.Label(search_frame, text="Search:").pack(anchor=tk.W)
         self.search_var = tk.StringVar()
         self.search_var.trace('w', self.filter_mods)
         search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=30)
-        search_entry.pack(anchor=tk.W, pady=(5, 0))
+        search_entry.pack(anchor=tk.W, pady=(5, 0), fill=tk.X)
         
-        # Create PanedWindow for resizable mod list and details
-        paned_window = ttk.PanedWindow(main_frame, orient=tk.VERTICAL)
-        paned_window.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Create inner PanedWindow for resizable mod list and details
+        paned_window = ttk.PanedWindow(outer_paned, orient=tk.VERTICAL)
         
         # Mod list frame
         mod_frame = ttk.LabelFrame(paned_window, text="Mod List", padding="10")
@@ -260,9 +265,14 @@ Total Mods: {len(self.archives)}
         files_frame.columnconfigure(0, weight=1)
         files_frame.rowconfigure(0, weight=1)
         
-        # Add frames to PanedWindow
+        # Add frames to inner PanedWindow (mod list and details)
         paned_window.add(mod_frame, weight=2)  # Mod list gets more initial space
         paned_window.add(details_frame, weight=1)  # Details gets less initial space
+        
+        # Add frames to outer PanedWindow (search and mod list/details)
+        # Give search frame more initial space by using higher weight
+        outer_paned.add(search_frame, weight=10)  # Search frame at top - higher weight for more space
+        outer_paned.add(paned_window, weight=5)  # Mod list/details area gets less initial space
         
         # Bind tree selection event
         self.tree.bind('<<TreeviewSelect>>', self.on_mod_select)
@@ -272,7 +282,7 @@ Total Mods: {len(self.archives)}
         
         # Status bar
         status_frame = ttk.Frame(main_frame)
-        status_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        status_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
         
         self.status_var = tk.StringVar()
         self.status_var.set("No modlist loaded")
@@ -281,6 +291,17 @@ Total Mods: {len(self.archives)}
         # Generated timestamp
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         ttk.Label(status_frame, text=f"Generated: {timestamp}").pack(side=tk.RIGHT)
+        
+        # Set initial sash position after window is fully rendered
+        # This ensures the search field is fully visible (approximately 100 pixels)
+        def set_sash_position():
+            try:
+                outer_paned.sashpos(0, 100)
+            except:
+                pass
+        
+        # Schedule after a short delay to ensure window is fully rendered
+        self.root.after(100, set_sash_position)
     
     def open_link(self, event):
         """Open link in default browser"""
