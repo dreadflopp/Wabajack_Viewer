@@ -46,50 +46,9 @@ Download the latest executable from the [Releases](https://github.com/youruserna
    - File structure that will be installed
 5. Use the tabs to switch between Overview and Files views
 
-## Building from Source
-
-To build your own executable:
-
-```bash
-python build.py
-```
-
-This will create a standalone executable in the `dist` folder.
-
 ## Requirements
 
 - Python 3.6+ (for running from source)
 - tkinter (included with most Python installations)
-- PyInstaller (for building executables)
 
-## Supported Platforms
 
-- Windows
-- Linux
-- macOS
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-## License
-
-This project is open source. Please check the license file for details.
-
-## Troubleshooting
-
-### tkinter not found
-If you get a tkinter error:
-- **Ubuntu/Debian**: `sudo apt-get install python3-tk`
-- **CentOS/RHEL**: `sudo yum install tkinter`
-- **macOS**: tkinter should be included with Python
-- **Windows**: tkinter is included with Python
-
-### Build Issues
-If you encounter build issues:
-1. Make sure PyInstaller is installed: `pip install pyinstaller`
-2. Try cleaning the build: `python build.py` (includes cleanup)
-3. Check that all dependencies are installed: `pip install -r requirements.txt`
