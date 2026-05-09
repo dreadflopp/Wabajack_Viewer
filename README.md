@@ -46,6 +46,20 @@ Download the latest executable from the [Releases](https://github.com/youruserna
    - File structure that will be installed
 5. Use the tabs to switch between Overview and Files views
 
+### Export Install Instructions
+
+You can export the same folder-based install summary used by the viewer to a text file:
+
+```bash
+python export_install_instructions.py path\to\modlist.wabbajack --contains "Static Mesh Improvement Mod"
+```
+
+By default this writes a report under `exports/`. You can also target a specific profile:
+
+```bash
+python export_install_instructions.py path\to\modlist.wabbajack --profile BottleRim
+```
+
 ## Requirements
 
 - Python 3.6+ (for running from source)

@@ -26,3 +26,15 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Wabbajack files and extracted contents
+wabbajack_files/
+
+# Helper scripts
+extract_wabbajack.py
+
+# temp files
+_temp_modlist.json
+
+# generated exports
+exports/
+export_install_instructions.py
