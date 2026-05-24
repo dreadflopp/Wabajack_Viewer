@@ -1,4 +1,5 @@
 import configparser
+from bisect import bisect_left
 from collections import Counter
 from difflib import SequenceMatcher
 import gzip
@@ -13,8 +14,64 @@ import webbrowser
 import zipfile
 
 
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.window = None
+        self.after_id = None
+        widget.bind("<Enter>", self.schedule_show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+
+    def schedule_show(self, event=None):
+        self.cancel()
+        self.after_id = self.widget.after(350, self.show)
+
+    def cancel(self):
+        if self.after_id is not None:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+
+    def show(self):
+        if self.window or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 16
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            self.window = tk.Toplevel(self.widget)
+            self.window.wm_overrideredirect(True)
+            self.window.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(
+                self.window,
+                text=self.text,
+                justify=tk.LEFT,
+                background="#ffffe0",
+                relief=tk.SOLID,
+                borderwidth=1,
+                font=("TkDefaultFont", 9),
+                padx=6,
+                pady=4,
+            )
+            label.pack()
+        except Exception:
+            self.window = None
+
+    def hide(self, event=None):
+        self.cancel()
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+
+
 class WabbajackGuideApp:
     SOURCE_DIRECTIVE_TYPES = {"FromArchive", "PatchedFromArchive"}
+    INLINE_SOURCE_PREFIX = "INLINEFILE::"
 
     @staticmethod
     def sanitize_filename(value):
@@ -41,6 +98,7 @@ class WabbajackGuideApp:
         self.mod_folder_meta_paths = {}
         self.mod_folder_files = {}
         self.mod_folder_archive_hashes = {}
+        self.synthetic_archive_by_hash = {}
 
         # Parsed InlineFile profile data
         self.inline_file_sources = {}
@@ -56,8 +114,15 @@ class WabbajackGuideApp:
         self.row_by_source_item_id = {}
         self.sort_column = "number"
         self.sort_reverse = False
+        self.sources_sort_column = "source_path"
+        self.sources_sort_reverse = False
+        self.files_sort_column = "target_path"
+        self.files_sort_reverse = False
+        self.sort_state_before_external_only = None
         self.current_selected_row = None
         self.external_compare_path = None
+        self.external_only_compare_names = []
+        self._tooltips = []
 
         self.current_wabbajack_file = None
         self.loaded_from_saved_modlist = False
@@ -114,7 +179,7 @@ class WabbajackGuideApp:
 
         try:
             self.set_status("Loading saved modlist...")
-            with gzip.open(path, "rt", encoding="utf-8") as handle:
+            with gzip.open(path, "rb") as handle:
                 payload = json.load(handle)
 
             self.modlist_data = payload.get("modlist_data") or {}
@@ -126,6 +191,7 @@ class WabbajackGuideApp:
             self.mod_folder_meta_paths = {}
             self.mod_folder_files = {}
             self.mod_folder_archive_hashes = {}
+            self.synthetic_archive_by_hash = {}
             self.inline_file_sources = {}
             self.inline_text_cache = {}
             self.profile_ini_files = payload.get("profile_ini_files") or {}
@@ -148,13 +214,15 @@ class WabbajackGuideApp:
             for row in rows:
                 hydrated = dict(row)
                 source_hashes = hydrated.pop("source_archive_hashes", [])
+                folder_files = hydrated.get("folder_files", [])
                 hydrated["source_archives"] = [
-                    self.archive_by_hash[archive_hash]
+                    self.resolve_archive_reference(archive_hash, folder_files)
                     for archive_hash in source_hashes
-                    if archive_hash in self.archive_by_hash
+                    if self.resolve_archive_reference(archive_hash, folder_files)
                 ]
                 hydrated["archive"] = self.archive_by_hash.get(hydrated.get("archive_hash", ""))
                 hydrated.setdefault("folder_files", [])
+                hydrated.setdefault("activation_state", "active" if hydrated.get("active", True) else "inactive")
                 hydrated["source_file_counts"] = self.count_files_by_archive(hydrated["folder_files"])
                 hydrated_rows.append(hydrated)
 
@@ -200,29 +268,60 @@ class WabbajackGuideApp:
         return "'" + text.replace("'", "'\"'\"'") + "'"
 
     @staticmethod
+    def is_mohidden_file(file_info):
+        """Return True when a file entry represents a .mohidden file."""
+        target_path = str(file_info.get("target_path", "")).lower()
+        archive_path = str(file_info.get("archive_path", "")).lower()
+        return target_path.endswith(".mohidden") or archive_path.endswith(".mohidden")
+
+    @staticmethod
+    def is_mod_meta_file_path(target_path):
+        """Return True for the per-mod meta.ini file stored under mods\\<folder>\\meta.ini."""
+        normalized = str(target_path or "").replace("/", "\\").lower()
+        return normalized.startswith("mods\\") and normalized.endswith("\\meta.ini")
+
+    @staticmethod
     def escape_batch(value):
         """Escape text for safe use inside quoted batch strings."""
         return str(value).replace("%", "%%")
 
     def build_grouped_install_data(self, row):
-        """Group install operations by archive filename for efficient extraction."""
+        """Group install operations by source type for efficient extraction."""
         folder_name = str(row.get("raw_name", ""))
         folder_prefix = f"mods\\{folder_name}\\"
         archive_names = {
             archive.get("Hash", ""): archive.get("Name", "")
             for archive in row.get("source_archives", [])
+            if not str(archive.get("State", {}).get("$type", "")).startswith("InlineFile")
         }
 
-        grouped = {}
+        archive_groups = {}
+        embedded_files = []
         for file_info in row.get("folder_files", []):
             archive_hash = file_info.get("archive_hash", "")
+            target_path = str(file_info.get("target_path", ""))
+            target_relative = target_path[len(folder_prefix):] if target_path.lower().startswith(folder_prefix.lower()) else target_path
+
+            if str(archive_hash).startswith(self.INLINE_SOURCE_PREFIX):
+                source_data_id = str(file_info.get("source_data_id", "")).strip()
+                if not source_data_id:
+                    archive_path = str(file_info.get("archive_path", ""))
+                    if archive_path.startswith("[Embedded InlineFile] "):
+                        source_data_id = archive_path[len("[Embedded InlineFile] "):].strip()
+                if source_data_id:
+                    embedded_files.append(
+                        {
+                            "source_data_id": source_data_id,
+                            "target_relative": target_relative,
+                        }
+                    )
+                continue
+
             archive_filename = archive_names.get(archive_hash, "")
             if not archive_filename:
                 continue
 
-            target_path = str(file_info.get("target_path", ""))
-            target_relative = target_path[len(folder_prefix):] if target_path.lower().startswith(folder_prefix.lower()) else target_path
-            group = grouped.setdefault(archive_filename, [])
+            group = archive_groups.setdefault(archive_filename, [])
             group.append(
                 {
                     "archive_path": str(file_info.get("archive_path", "")),
@@ -230,19 +329,35 @@ class WabbajackGuideApp:
                 }
             )
 
-        return grouped
+        return {"archive_groups": archive_groups, "embedded_files": embedded_files}
 
     def build_batch_install_script(self, row):
         """Return a grouped Windows batch installer script for the selected mod."""
         folder_name = str(row.get("raw_name", row.get("name", "mod")))
         grouped = self.build_grouped_install_data(row)
+        archive_groups = grouped.get("archive_groups", {})
+        embedded_files = grouped.get("embedded_files", [])
+        wabbajack_name = Path(self.current_wabbajack_file).name if self.current_wabbajack_file else ""
         lines = [
             "@echo off",
-            "setlocal DisableDelayedExpansion",
+            "setlocal EnableDelayedExpansion",
             'set "SCRIPT_DIR=%~dp0"',
             f'set "OUTPUT_DIR=%SCRIPT_DIR%{self.escape_batch(folder_name)}"',
             'set "TEMP_ROOT=%SCRIPT_DIR%.extract_temp"',
             'set "LOG_PATH=%SCRIPT_DIR%install_errors.log"',
+            f'set "WABBAJACK_PATH=%SCRIPT_DIR%{self.escape_batch(wabbajack_name)}"' if wabbajack_name else 'set "WABBAJACK_PATH="',
+            'set "ARCHIVE_SEARCH_DIRS=%SCRIPT_DIR%"',
+            ':parse_args',
+            'if "%~1"=="" goto args_done',
+            'set "ARG=%~1"',
+            '  if /I "!ARG:~0,11!"=="/wabbajack:" (',
+            '    set "WABBAJACK_PATH=!ARG:~11!"',
+            '  ) else (',
+            '    set "ARCHIVE_SEARCH_DIRS=!ARCHIVE_SEARCH_DIRS!;!ARG!"',
+            '  )',
+            'shift',
+            'goto parse_args',
+            ':args_done',
             'where 7z >nul 2>nul',
             'if errorlevel 1 (',
             '  echo 7z is required and was not found in PATH.',
@@ -253,17 +368,24 @@ class WabbajackGuideApp:
             'mkdir "%OUTPUT_DIR%" >nul 2>nul',
             'break > "%LOG_PATH%"',
             '',
+            ':resolve_archive',
+            'set "FOUND_ARCHIVE_PATH="',
+            'for %%D in ("%ARCHIVE_SEARCH_DIRS:;=" "%") do (',
+            '  if not defined FOUND_ARCHIVE_PATH if exist "%%~fD\\%ARCHIVE_FILE%" set "FOUND_ARCHIVE_PATH=%%~fD\\%ARCHIVE_FILE%"',
+            ')',
+            'exit /b',
+            '',
         ]
 
-        for index, (archive_filename, items) in enumerate(grouped.items(), start=1):
+        for index, (archive_filename, items) in enumerate(archive_groups.items(), start=1):
             escaped_archive_filename = self.escape_batch(archive_filename)
             lines.extend(
                 [
                     f'rem Archive group {index}: {escaped_archive_filename}',
                     f'set "ARCHIVE_FILE={escaped_archive_filename}"',
-                    'set "ARCHIVE_PATH=%SCRIPT_DIR%%ARCHIVE_FILE%"',
+                    'call :resolve_archive',
                     f'set "STAGE_DIR=%TEMP_ROOT%\\archive_{index}"',
-                    'if not exist "%ARCHIVE_PATH%" (',
+                    'if not defined FOUND_ARCHIVE_PATH (',
                     '  >> "%LOG_PATH%" echo MISSING ARCHIVE: %ARCHIVE_FILE%',
                     '  goto :after_archive_' + str(index),
                     ')',
@@ -271,7 +393,7 @@ class WabbajackGuideApp:
                 ]
             )
 
-            extract_command = '7z x -y "-o%STAGE_DIR%" "%ARCHIVE_PATH%"'
+            extract_command = '7z x -y "-o%STAGE_DIR%" "%FOUND_ARCHIVE_PATH%"'
             for item in items:
                 extract_command += f' "{self.escape_batch(item["archive_path"])}"'
             lines.append(extract_command + ' >nul')
@@ -306,11 +428,48 @@ class WabbajackGuideApp:
                 ]
             )
 
+        if embedded_files:
+            lines.extend(
+                [
+                    'rem Embedded InlineFile payloads from .wabbajack',
+                    'if "%WABBAJACK_PATH%"=="" (',
+                    '  >> "%LOG_PATH%" echo MISSING WABBAJACK FILE: no /wabbajack:path provided and no default file set',
+                    ') else if not exist "%WABBAJACK_PATH%" (',
+                    '  >> "%LOG_PATH%" echo MISSING WABBAJACK FILE: %WABBAJACK_PATH%',
+                    ')',
+                    '',
+                ]
+            )
+
+        for index, item in enumerate(embedded_files, start=1):
+            source_data_id = self.escape_batch(item.get("source_data_id", ""))
+            target_relative = self.escape_batch(item.get("target_relative", ""))
+            lines.extend(
+                [
+                    f'rem Embedded file {index}: {source_data_id}',
+                    f'set "STAGE_DIR=%TEMP_ROOT%\\embedded_{index}"',
+                    'if exist "%WABBAJACK_PATH%" (',
+                    '  mkdir "%STAGE_DIR%" >nul 2>nul',
+                    f'  7z x -y "-o%STAGE_DIR%" "%WABBAJACK_PATH%" "{source_data_id}" >nul',
+                    f'  if exist "%STAGE_DIR%\\{source_data_id}" (',
+                    f'    for %%D in ("%OUTPUT_DIR%\\{target_relative}") do mkdir "%%~dpD" >nul 2>nul',
+                    f'    copy /Y "%STAGE_DIR%\\{source_data_id}" "%OUTPUT_DIR%\\{target_relative}" >nul',
+                    '  ) else (',
+                    f'    >> "%LOG_PATH%" echo MISSING EMBEDDED FILE: {source_data_id}',
+                    '  )',
+                    ')',
+                    'if exist "%STAGE_DIR%" rmdir /s /q "%STAGE_DIR%"',
+                    '',
+                ]
+            )
+
         lines.extend(
             [
                 'if exist "%TEMP_ROOT%" rmdir /s /q "%TEMP_ROOT%"',
                 'echo Install replay complete. Output: %OUTPUT_DIR%',
                 'echo Errors logged to: %LOG_PATH%',
+                'echo Optional args: [archiveDir1] [archiveDir2] ... [/wabbajack:C:\\path\\list.wabbajack]',
+                'pause',
                 'endlocal',
             ]
         )
@@ -320,6 +479,9 @@ class WabbajackGuideApp:
         """Return a grouped Bash installer script for the selected mod."""
         folder_name = str(row.get("raw_name", row.get("name", "mod")))
         grouped = self.build_grouped_install_data(row)
+        archive_groups = grouped.get("archive_groups", {})
+        embedded_files = grouped.get("embedded_files", [])
+        wabbajack_name = Path(self.current_wabbajack_file).name if self.current_wabbajack_file else ""
         lines = [
             '#!/usr/bin/env bash',
             'set +e',
@@ -328,6 +490,15 @@ class WabbajackGuideApp:
             f'OUTPUT_DIR="$SCRIPT_DIR/{folder_name}"',
             'TEMP_ROOT="$SCRIPT_DIR/.extract_temp"',
             'LOG_PATH="$SCRIPT_DIR/install_errors.log"',
+            f'WABBAJACK_PATH="$SCRIPT_DIR/{wabbajack_name}"' if wabbajack_name else 'WABBAJACK_PATH=""',
+            'SEARCH_DIRS=("$SCRIPT_DIR")',
+            'for arg in "$@"; do',
+            '  if [[ "$arg" == --wabbajack=* ]]; then',
+            '    WABBAJACK_PATH="${arg#--wabbajack=}"',
+            '  else',
+            '    SEARCH_DIRS+=("$arg")',
+            '  fi',
+            'done',
             '',
             'if ! command -v 7z >/dev/null 2>&1; then',
             '  echo "7z is required and was not found in PATH." >&2',
@@ -338,16 +509,28 @@ class WabbajackGuideApp:
             'mkdir -p "$TEMP_ROOT" "$OUTPUT_DIR"',
             ': > "$LOG_PATH"',
             '',
+            'resolve_archive_path() {',
+            '  local archive_file="$1"',
+            '  local dir',
+            '  for dir in "${SEARCH_DIRS[@]}"; do',
+            '    if [ -f "$dir/$archive_file" ]; then',
+            '      printf "%s" "$dir/$archive_file"',
+            '      return 0',
+            '    fi',
+            '  done',
+            '  return 1',
+            '}',
+            '',
         ]
 
-        for index, (archive_filename, items) in enumerate(grouped.items(), start=1):
+        for index, (archive_filename, items) in enumerate(archive_groups.items(), start=1):
             lines.extend(
                 [
                     f'# Archive group {index}: {archive_filename}',
                     f'archive_file={self.quote_bash(archive_filename)}',
-                    'archive_path="$SCRIPT_DIR/$archive_file"',
+                    'archive_path="$(resolve_archive_path "$archive_file")"',
                     f'stage_dir="$TEMP_ROOT/archive_{index}"',
-                    'if [ ! -f "$archive_path" ]; then',
+                    'if [ -z "$archive_path" ] || [ ! -f "$archive_path" ]; then',
                     '  echo "MISSING ARCHIVE: $archive_file" >> "$LOG_PATH"',
                     'else',
                     '  mkdir -p "$stage_dir"',
@@ -384,30 +567,51 @@ class WabbajackGuideApp:
                 ]
             )
 
+        if embedded_files:
+            lines.extend(
+                [
+                    '# Embedded InlineFile payloads from .wabbajack',
+                    'if [ -z "$WABBAJACK_PATH" ]; then',
+                    '  echo "MISSING WABBAJACK FILE: no --wabbajack= path provided and no default file set" >> "$LOG_PATH"',
+                    'elif [ ! -f "$WABBAJACK_PATH" ]; then',
+                    '  echo "MISSING WABBAJACK FILE: $WABBAJACK_PATH" >> "$LOG_PATH"',
+                    'fi',
+                    '',
+                ]
+            )
+
+        for index, item in enumerate(embedded_files, start=1):
+            source_data_id = item.get("source_data_id", "")
+            target_relative = item.get("target_relative", "")
+            lines.extend(
+                [
+                    f'# Embedded file {index}: {source_data_id}',
+                    f'stage_dir="$TEMP_ROOT/embedded_{index}"',
+                    'if [ -f "$WABBAJACK_PATH" ]; then',
+                    '  mkdir -p "$stage_dir"',
+                    f'  7z x -y "-o$stage_dir" "$WABBAJACK_PATH" {self.quote_bash(source_data_id)} >/dev/null 2>&1',
+                    f'  if [ -f "$stage_dir/{source_data_id}" ]; then',
+                    f'    target_rel={self.quote_bash(target_relative)}',
+                    '    mkdir -p "$(dirname "$OUTPUT_DIR/$target_rel")"',
+                    f'    cp -f "$stage_dir/{source_data_id}" "$OUTPUT_DIR/$target_rel"',
+                    '  else',
+                    f'    echo "MISSING EMBEDDED FILE: {source_data_id}" >> "$LOG_PATH"',
+                    '  fi',
+                    'fi',
+                    'rm -rf "$stage_dir"',
+                    '',
+                ]
+            )
+
         lines.extend(
             [
                 'rm -rf "$TEMP_ROOT"',
                 'echo "Install replay complete. Output: $OUTPUT_DIR"',
                 'echo "Errors logged to: $LOG_PATH"',
+                'echo "Optional args: [archiveDir1] [archiveDir2] ... [--wabbajack=/path/to/list.wabbajack]"',
             ]
         )
         return "\n".join(lines) + "\n"
-
-    def get_mod_page_url(self, row):
-        """Return the same mod-page URL source used by the details panel."""
-        if not row or row.get("is_separator"):
-            return ""
-
-        source_archives = row.get("source_archives", [])
-        for source_archive in source_archives:
-            page = self.build_archive_links(source_archive).get("page")
-            if page:
-                return page
-
-        archive = row.get("archive")
-        if archive:
-            return self.build_archive_links(archive).get("page") or ""
-        return ""
 
     def copy_selected_mod_name(self):
         """Copy the selected mod name to clipboard."""
@@ -435,6 +639,141 @@ class WabbajackGuideApp:
             webbrowser.open(url)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open mod URL: {e}")
+
+    def add_tooltip(self, widget, text):
+        """Attach a tooltip to a widget and keep it alive."""
+        if not text:
+            return
+        self._tooltips.append(Tooltip(widget, text))
+
+    @staticmethod
+    def format_sort_heading(base_label, is_active, reverse):
+        """Format a tree heading label with a simple ASCII sort indicator."""
+        if not is_active:
+            return base_label
+        return f"{base_label} {'▾' if reverse else '▴'}"
+
+    def update_sort_indicators(self):
+        """Refresh visible sort labels for the mod list and detail trees."""
+        if hasattr(self, "tree"):
+            mod_headings = {
+                "#0": "#",
+                "active": "Active",
+                "name": "Mod Name",
+                "sources": "Sources",
+                "author": "Author",
+                "version": "Version",
+                "size": "Size (MB)",
+            }
+            for column, label in mod_headings.items():
+                is_active = (column == "#0" and self.sort_column == "number") or (column != "#0" and self.sort_column == column)
+                reverse = self.sort_reverse if is_active else False
+                self.tree.heading(column, text=self.format_sort_heading(label, is_active, reverse))
+
+        if hasattr(self, "sources_tree"):
+            source_headings = {
+                "#0": ("Source Archive", "source"),
+                "target_path": ("Install Path", "target_path"),
+                "source_path": ("Source Path", "source_path"),
+                "size": ("Size (bytes)", "size"),
+                "kind": ("Directive", "kind"),
+            }
+            for column, (label, sort_key) in source_headings.items():
+                is_active = self.sources_sort_column == sort_key
+                reverse = self.sources_sort_reverse if is_active else False
+                self.sources_tree.heading(column, text=self.format_sort_heading(label, is_active, reverse))
+
+        if hasattr(self, "files_tree"):
+            file_headings = {
+                "#0": ("Target Path", "target_path"),
+                "source_mod": ("Source Mod", "source_mod"),
+                "source_path": ("Source Path", "source_path"),
+                "size": ("Size (bytes)", "size"),
+            }
+            for column, (label, sort_key) in file_headings.items():
+                is_active = self.files_sort_column == sort_key
+                reverse = self.files_sort_reverse if is_active else False
+                self.files_tree.heading(column, text=self.format_sort_heading(label, is_active, reverse))
+
+    def get_mod_page_urls(self, row):
+        """Return all distinct mod-page URLs available for a row."""
+        if not row or row.get("is_separator"):
+            return []
+
+        urls = []
+        seen = set()
+        for source_archive in row.get("source_archives", []):
+            page = self.build_archive_links(source_archive).get("page")
+            if page and page not in seen:
+                seen.add(page)
+                urls.append((source_archive, page))
+
+        return urls
+
+    def get_mod_page_url(self, row):
+        """Return the first mod-page URL source used by the details panel."""
+        urls = self.get_mod_page_urls(row)
+        return urls[0][1] if urls else ""
+
+    def get_source_archive_label(self, source_archive):
+        """Return a user-facing label for a source archive or embedded source."""
+        if not source_archive:
+            return "Unknown"
+        state = source_archive.get("State", {})
+        return state.get("Name") or source_archive.get("Name", "Unknown")
+
+    def get_source_sort_value(self, source_archive, source_files, column):
+        """Compute a stable sort key for a source tree row."""
+        state = source_archive.get("State", {}) if source_archive else {}
+        if column == "source":
+            return self.get_source_archive_label(source_archive).lower()
+        if column == "target_path":
+            return min((str(item.get("target_path", "")).lower() for item in source_files), default="")
+        if column == "source_path":
+            return min((str(item.get("archive_path", "")).lower() for item in source_files), default="")
+        if column == "size":
+            return sum(int(item.get("size", 0) or 0) for item in source_files)
+        if column == "kind":
+            return ",".join(sorted({str(item.get("directive_type", "")).lower() for item in source_files if item.get("directive_type")}))
+        return self.get_source_archive_label(source_archive).lower()
+
+    def sort_files_for_column(self, files):
+        """Sort file rows using the current Files tab column selection."""
+        column = self.files_sort_column
+        reverse = self.files_sort_reverse
+
+        def key(item):
+            if column == "source_mod":
+                return str(item.get("source_mod", "")).lower()
+            if column == "source_path":
+                return str(item.get("archive_path", "")).lower()
+            if column == "size":
+                return int(item.get("size", 0) or 0)
+            return str(item.get("target_path", "")).lower()
+
+        return sorted(files, key=key, reverse=reverse)
+
+    def on_sources_sort_requested(self, column):
+        """Sort the Sources tab by the clicked column."""
+        if column == self.sources_sort_column:
+            self.sources_sort_reverse = not self.sources_sort_reverse
+        else:
+            self.sources_sort_column = column
+            self.sources_sort_reverse = False
+        if self.current_selected_row:
+            self.update_sources_tab(self.current_selected_row)
+        self.update_sort_indicators()
+
+    def on_files_sort_requested(self, column):
+        """Sort the Files tab by the clicked column."""
+        if column == self.files_sort_column:
+            self.files_sort_reverse = not self.files_sort_reverse
+        else:
+            self.files_sort_column = column
+            self.files_sort_reverse = False
+        if self.current_selected_row:
+            self.update_files_tab(self.current_selected_row)
+        self.update_sort_indicators()
 
     def export_install_script_for_selected(self, script_type):
         """Export a BAT or Bash installer script for the selected mod."""
@@ -475,11 +814,22 @@ class WabbajackGuideApp:
             messagebox.showinfo(
                 "Install Script Exported",
                 f"Exported:\n{Path(output_path).name}\n\n"
-                "Place the source archives beside this script before running it.\n"
-                "The script groups extraction by archive and logs errors while continuing."
+                "Usage: pass archive folder paths as script arguments.\n"
+                "Optional: pass /wabbajack:<path> (BAT) or --wabbajack=<path> (Bash) for embedded files.\n"
+                "The script groups extraction by source and logs errors while continuing."
             )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export install script: {e}")
+
+    def collapse_all_mod_sections(self):
+        """Collapse all top-level rows in the mod list tree."""
+        for item_id in self.tree.get_children(""):
+            self.tree.item(item_id, open=False)
+
+    def expand_all_mod_sections(self):
+        """Expand all top-level rows in the mod list tree."""
+        for item_id in self.tree.get_children(""):
+            self.tree.item(item_id, open=True)
 
     def on_mod_right_click(self, event):
         """Show row actions for the clicked mod."""
@@ -495,11 +845,20 @@ class WabbajackGuideApp:
 
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Copy Mod Name", command=self.copy_selected_mod_name)
+        menu.add_separator()
+        menu.add_command(label="Expand All", command=self.expand_all_mod_sections)
+        menu.add_command(label="Collapse All", command=self.collapse_all_mod_sections)
 
         if not row.get("is_separator"):
-            url = self.get_mod_page_url(row)
-            if url:
-                menu.add_command(label="Mod URL", command=self.open_selected_mod_page)
+            urls = self.get_mod_page_urls(row)
+            if len(urls) == 1:
+                menu.add_command(label="Mod URL", command=lambda value=urls[0][1]: webbrowser.open(value))
+            elif len(urls) > 1:
+                url_menu = tk.Menu(menu, tearoff=0)
+                for source_archive, url in urls:
+                    label = self.get_source_archive_label(source_archive)
+                    url_menu.add_command(label=label, command=lambda value=url: webbrowser.open(value))
+                menu.add_cascade(label="Mod URLs", menu=url_menu)
             if row.get("folder_files"):
                 menu.add_command(
                     label="Export BAT Install Script",
@@ -515,18 +874,229 @@ class WabbajackGuideApp:
         finally:
             menu.grab_release()
 
-    def build_modlist_txt(self):
-        """Return modlist.txt content in MO2 load-order format."""
-        if self.profile_modlist_text:
-            return self.profile_modlist_text
+    def build_modlist_txt(self, include_external_only=False, deactivate_external_only=False, reverse_for_mo2=True):
+        """Return modlist.txt content in MO2 load-order format.
+        
+        Builds visible order first (including external-only entries at their positions),
+        then reverses to match modlist.txt format.
+        """
+        # Build visible order. For standard export, honor current sort.
+        # For merged export, use compare placement order for external-only entries.
+        visible_order = []
+        if include_external_only:
+            export_rows = self.get_rows_in_compare_placement_order(include_external_only=True)
+        else:
+            export_rows = self.get_rows_in_current_sort_order()
+
+        for row in export_rows:
+            is_external_only = bool(row.get("external_only"))
+            if is_external_only:
+                prefix = "-" if deactivate_external_only else "+"
+            else:
+                prefix = self.get_activation_prefix_from_state(row.get("activation_state") or ("active" if row.get("active") else "inactive"))
+            raw_name = row.get("raw_name") or row.get("name") or "mod"
+            visible_order.append((prefix, raw_name, is_external_only))
+
+        # MO2 modlist.txt uses reverse of display order. For diagnostics, caller can disable reversal.
+        ordered_rows = reversed(visible_order) if reverse_for_mo2 else visible_order
+        lines = [f"{prefix}{name}" for prefix, name, _ in ordered_rows]
+        return "\r\n".join(lines) + ("\r\n" if lines else "")
+
+    @staticmethod
+    def count_nonempty_lines(text):
+        """Count non-empty lines in an exported text block."""
+        return sum(1 for line in str(text).splitlines() if line.strip())
+
+    @staticmethod
+    def get_activation_state_from_prefix(prefix):
+        """Map a modlist prefix to an activation state."""
+        if prefix == "*":
+            return "always"
+        if prefix == "-":
+            return "inactive"
+        return "active"
+
+    @staticmethod
+    def get_activation_prefix_from_state(state):
+        """Map an activation state to a modlist prefix."""
+        if state == "always":
+            return "*"
+        if state == "inactive":
+            return "-"
+        return "+"
+
+    @staticmethod
+    def get_activation_mark_for_row(row):
+        """Return a compact table mark for the row activation state."""
+        if row.get("is_separator"):
+            return ""
+        state = row.get("activation_state") or ("active" if row.get("active") else "inactive")
+        if state == "always":
+            return "[*]"
+        if state == "inactive":
+            return "[ ]"
+        return "[x]"
+
+    @staticmethod
+    def get_activation_label_for_row(row):
+        """Return a human-readable activation label for the row."""
+        state = row.get("activation_state") or ("active" if row.get("active") else "inactive")
+        if state == "always":
+            return "Always Active"
+        if state == "inactive":
+            return "Inactive"
+        return "Active"
+
+    def get_rows_in_compare_placement_order(self, include_external_only=False):
+        """Return rows in compare placement order, optionally including external-only entries."""
+        if not include_external_only or not self.external_only_compare_names:
+            return list(self.mod_rows)
+
+        inserts_by_index = {}
+        for entry in self.external_only_compare_names:
+            insert_index = int(entry.get("insert_index", len(self.mod_rows)))
+            inserts_by_index.setdefault(insert_index, []).append(entry)
+
+        interleaved_rows = []
+        wb_index = 0
+        external_counter = 0
+
+        for row in self.mod_rows:
+            if not row.get("is_separator"):
+                for entry in inserts_by_index.get(wb_index, []):
+                    external_counter += 1
+                    raw_name = str(entry.get("name", ""))
+                    display_name, is_separator = self.parse_external_entry_name(raw_name)
+                    interleaved_rows.append(
+                        {
+                            "number": f"E{external_counter}",
+                            "name": display_name,
+                            "raw_name": raw_name,
+                            "folder_key": self.normalize_mod_key(raw_name),
+                            "active": False,
+                            "activation_state": "inactive",
+                            "is_separator": is_separator,
+                            "author": "-",
+                            "version": "",
+                            "size_mb": "",
+                            "direct_link_count": 0,
+                            "archive_hash": "",
+                            "archive_name": "",
+                            "archive": None,
+                            "folder_meta": {},
+                            "source_archives": [],
+                            "folder_files": [],
+                            "source_file_counts": {},
+                            "compare_status": "external_only",
+                            "external_only": True,
+                        }
+                    )
+                wb_index += 1
+
+            interleaved_rows.append(row)
+
+        for entry in inserts_by_index.get(wb_index, []):
+            external_counter += 1
+            raw_name = str(entry.get("name", ""))
+            display_name, is_separator = self.parse_external_entry_name(raw_name)
+            interleaved_rows.append(
+                {
+                    "number": f"E{external_counter}",
+                    "name": display_name,
+                    "raw_name": raw_name,
+                    "folder_key": self.normalize_mod_key(raw_name),
+                    "active": False,
+                    "activation_state": "inactive",
+                    "is_separator": is_separator,
+                    "author": "-",
+                    "version": "",
+                    "size_mb": "",
+                    "direct_link_count": 0,
+                    "archive_hash": "",
+                    "archive_name": "",
+                    "archive": None,
+                    "folder_meta": {},
+                    "source_archives": [],
+                    "folder_files": [],
+                    "source_file_counts": {},
+                    "compare_status": "external_only",
+                    "external_only": True,
+                }
+            )
+
+        return interleaved_rows
+
+    def get_rows_in_current_sort_order(self):
+        """Return base mod rows ordered exactly like the current sort settings."""
+        rows = list(self.mod_rows)
+
+        def sort_key(item):
+            if self.sort_column == "number":
+                number = item.get("number", 0)
+                if isinstance(number, str) and number.startswith("E"):
+                    try:
+                        return (1, int(number[1:]))
+                    except Exception:
+                        return (1, 0)
+                try:
+                    return (0, int(number))
+                except Exception:
+                    return (0, 0)
+            if self.sort_column == "active":
+                state = item.get("activation_state") or ("active" if item.get("active") else "inactive")
+                if state == "always":
+                    return 2
+                if state == "active":
+                    return 1
+                return 0
+            if self.sort_column == "name":
+                return str(item.get("name", "")).lower()
+            if self.sort_column == "sources":
+                return len(item.get("source_archives", []))
+            if self.sort_column == "author":
+                return str(item.get("author", "")).lower()
+            if self.sort_column == "version":
+                return str(item.get("version", "")).lower()
+            if self.sort_column == "size":
+                try:
+                    return float(item.get("size_mb") or 0)
+                except Exception:
+                    return 0.0
+            return item.get("number", 0)
+
+        return sorted(rows, key=sort_key, reverse=self.sort_reverse)
+
+    def copy_tree_selection(self, event=None):
+        """Copy selected rows from the mod table as tab-separated text."""
+        if not hasattr(self, "tree"):
+            return "break"
+
+        selection = self.tree.selection()
+        if not selection:
+            return "break"
 
         lines = []
-        for row in reversed(self.mod_rows):
-            prefix = "+" if row.get("active", True) else "-"
-            raw_name = row.get("raw_name") or row.get("name") or "mod"
-            lines.append(f"{prefix}{raw_name}")
+        for item_id in selection:
+            row = self.row_by_item_id.get(item_id)
+            if not row:
+                continue
 
-        return "\r\n".join(lines) + ("\r\n" if lines else "")
+            number = str(row.get("number", ""))
+            active_mark = self.get_activation_mark_for_row(row)
+            name = str(row.get("name", ""))
+            links = "" if row.get("is_separator") else str(row.get("direct_link_count", 0))
+            author = str(row.get("author", ""))
+            version = str(row.get("version", ""))
+            size_mb = str(row.get("size_mb", ""))
+            lines.append("\t".join([number, active_mark, name, links, author, version, size_mb]))
+
+        if not lines:
+            return "break"
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self.set_status(f"Copied {len(lines)} table row(s) to clipboard")
+        return "break"
 
     def export_modlist_txt(self):
         """Export the current MO2 modlist.txt load-order file."""
@@ -534,6 +1104,76 @@ class WabbajackGuideApp:
             messagebox.showwarning("No Data", "Load a Wabbajack file first.")
             return
 
+        include_external_only = False
+        deactivate_external_only = False
+        has_external_only = bool(self.external_only_compare_names)
+        
+        if has_external_only:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Export modlist.txt Options")
+            dialog.geometry("450x220")
+            dialog.resizable(False, False)
+            dialog.transient(self.root)
+            dialog.grab_set()
+            
+            frame = ttk.Frame(dialog, padding="20")
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            ttk.Label(
+                frame,
+                text="A compare modlist is loaded with external-only entries.",
+                font=("TkDefaultFont", 10)
+            ).pack(anchor=tk.W, pady=(0, 10))
+            
+            ttk.Label(
+                frame,
+                text=f"External-only entries found: {len(self.external_only_compare_names)}",
+                font=("TkDefaultFont", 9, "italic")
+            ).pack(anchor=tk.W, pady=(0, 15))
+            
+            include_var = tk.BooleanVar(value=False)
+            include_check = ttk.Checkbutton(
+                frame,
+                text="Include external-only mods in export (merged modlist)",
+                variable=include_var
+            )
+            include_check.pack(anchor=tk.W, pady=(0, 10))
+            
+            deactivate_var = tk.BooleanVar(value=False)
+            deactivate_check = ttk.Checkbutton(
+                frame,
+                text="Deactivate all external-only mods (prefix with -)",
+                variable=deactivate_var,
+                state=tk.DISABLED
+            )
+            deactivate_check.pack(anchor=tk.W, pady=(0, 20))
+            
+            def on_include_toggled(*args):
+                deactivate_check.config(state=tk.NORMAL if include_var.get() else tk.DISABLED)
+            
+            include_var.trace("w", on_include_toggled)
+            
+            button_frame = ttk.Frame(frame)
+            button_frame.pack(fill=tk.X)
+            
+            def on_ok():
+                nonlocal include_external_only, deactivate_external_only
+                include_external_only = include_var.get()
+                deactivate_external_only = deactivate_var.get() and include_external_only
+                dialog.destroy()
+            
+            export_button = ttk.Button(button_frame, text="Export", command=on_ok)
+            export_button.pack(side=tk.RIGHT, padx=(5, 0))
+            cancel_button = ttk.Button(button_frame, text="Cancel", command=dialog.destroy)
+            cancel_button.pack(side=tk.RIGHT)
+
+            self.add_tooltip(include_check, "Include entries that exist only in the comparison modlist.")
+            self.add_tooltip(deactivate_check, "Write external-only entries with a leading - in the exported modlist.")
+            self.add_tooltip(export_button, "Generate the modlist export with the selected options.")
+            self.add_tooltip(cancel_button, "Close the export options dialog without exporting.")
+            
+            self.root.wait_window(dialog)
+        
         output_path = filedialog.asksaveasfilename(
             title="Export modlist.txt",
             defaultextension=".txt",
@@ -550,11 +1190,96 @@ class WabbajackGuideApp:
         try:
             output = Path(output_path)
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(self.build_modlist_txt(), encoding="utf-8", newline="")
-            self.set_status(f"Exported modlist.txt: {output.name}")
-            messagebox.showinfo("modlist.txt Exported", f"Saved modlist.txt to:\n{output}")
+            modlist_text = self.build_modlist_txt(
+                include_external_only=include_external_only,
+                deactivate_external_only=deactivate_external_only
+            )
+            output.write_text(modlist_text, encoding="utf-8", newline="")
+            line_count = self.count_nonempty_lines(modlist_text)
+            base_count = len(self.mod_rows)
+            external_only_count = len(self.external_only_compare_names) if include_external_only else 0
+
+            export_type = "merged " if include_external_only else ""
+            deactivate_note = " (external-only deactivated)" if deactivate_external_only else ""
+            self.set_status(
+                f"Exported {export_type}modlist.txt: {output.name}{deactivate_note} "
+                f"({line_count} lines = {base_count} base + {external_only_count} external-only)"
+            )
+            messagebox.showinfo(
+                "modlist.txt Exported",
+                f"Saved {export_type}modlist.txt to:\n{output}{deactivate_note}\n\n"
+                f"Line count: {line_count}\n"
+                f"Base rows: {base_count}\n"
+                f"External-only rows included: {external_only_count}\n"
+                "Order: MO2 file order (reverse of viewer top-to-bottom)."
+            )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export modlist.txt: {e}")
+
+    def get_separator_folder_names(self):
+        """Return base separator folder names in visible order, excluding external-only rows."""
+        seen = set()
+        names = []
+        for row in self.mod_rows:
+            if row.get("external_only") or row.get("compare_status") == "external_only":
+                continue
+            if not row.get("is_separator"):
+                continue
+            raw_name = str(row.get("raw_name") or "").strip()
+            if not raw_name or raw_name in seen:
+                continue
+            seen.add(raw_name)
+            names.append(raw_name)
+        return names
+
+    def parse_external_entry_name(self, name):
+        """Parse external entry name and detect separators, return (display_name, is_separator)."""
+        raw_name = str(name or "").strip()
+        is_separator = raw_name.lower().endswith("_separator")
+        display_name = raw_name[:-10] if is_separator else raw_name
+        return display_name, is_separator
+
+    def export_separators_zip(self):
+        """Export all modlist separator folders (ending in _separator) as a zip."""
+        if not self.mod_rows:
+            messagebox.showwarning("No Data", "Load a Wabbajack file first.")
+            return
+
+        separator_names = self.get_separator_folder_names()
+        if not separator_names:
+            messagebox.showwarning("No Separators", "No _separator folders were found in the loaded modlist.")
+            return
+
+        modlist_name = self.sanitize_filename(self.modlist_data.get("Name", "modlist")) if self.modlist_data else "modlist"
+        suggested_name = f"{modlist_name}_separators.zip"
+        output_path = filedialog.asksaveasfilename(
+            title="Export separators zip",
+            defaultextension=".zip",
+            initialfile=suggested_name,
+            filetypes=[
+                ("ZIP archive", "*.zip"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not output_path:
+            return
+
+        try:
+            output = Path(output_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+            with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_handle:
+                for folder_name in separator_names:
+                    folder_entry = folder_name.replace("\\", "/").rstrip("/") + "/"
+                    zip_handle.writestr(folder_entry, "")
+
+            self.set_status(f"Exported separators zip: {output.name} ({len(separator_names)} folders)")
+            messagebox.showinfo(
+                "Separators Exported",
+                f"Saved separators zip to:\n{output}\n\nFolders exported: {len(separator_names)}"
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export separators zip: {e}")
 
     @staticmethod
     def normalize_mod_key(raw_name):
@@ -562,21 +1287,27 @@ class WabbajackGuideApp:
         return str(raw_name or "").strip().lower()
 
     def parse_external_modlist_text(self, text):
-        """Parse an external modlist and return names in display order."""
-        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        """Parse an external modlist and return names in display order (including separators)."""
+        lines = []
+        for raw_line in str(text).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            # MO2 modlist comments begin with '#'.
+            if line.startswith("#"):
+                continue
+            lines.append(line)
         if not lines:
             return []
 
         prefixed = sum(1 for line in lines if line[:1] in "+-")
         if prefixed >= max(1, len(lines) // 2):
             entries = self.parse_modlist_entries("\n".join(lines))
-            return [entry["raw_name"] for entry in entries if not entry.get("is_separator")]
+            return [entry["raw_name"] for entry in entries]
 
         names = []
         for line in lines:
             raw_name = line[1:].strip() if line[:1] in "+-" else line
-            if raw_name.lower().endswith("_separator"):
-                continue
             names.append(raw_name)
         return names
 
@@ -610,28 +1341,49 @@ class WabbajackGuideApp:
             messagebox.showwarning("No Entries", "The selected modlist.txt has no comparable mod entries.")
             return
 
-        external_keys = [self.normalize_mod_key(name) for name in external_names]
-        wb_rows = [row for row in self.mod_rows if not row.get("is_separator")]
+        external_name_key_pairs = [(name, self.normalize_mod_key(name)) for name in external_names]
+        external_keys = [key for _, key in external_name_key_pairs]
+        wb_rows = list(self.mod_rows)
         wb_keys = [self.normalize_mod_key(row.get("raw_name") or row.get("name")) for row in wb_rows]
 
         for row in self.mod_rows:
             row["compare_status"] = None
+        self.external_only_compare_names = []
 
         # Use an LCS-style matcher (same family of idea as git diff) so stable subsequences stay green.
         matcher = SequenceMatcher(None, wb_keys, external_keys, autojunk=False)
         green_indices = set()
+        wb_to_external_index = {}
         for a_start, _b_start, size in matcher.get_matching_blocks():
             for index in range(a_start, a_start + size):
                 green_indices.add(index)
+        for a_start, b_start, size in matcher.get_matching_blocks():
+            for offset in range(size):
+                wb_to_external_index[a_start + offset] = b_start + offset
 
         external_counts = Counter(external_keys)
         consumed_counts = Counter()
+        used_external_indices = set()
+        for ext_index in wb_to_external_index.values():
+            used_external_indices.add(ext_index)
 
         for index in green_indices:
             row = wb_rows[index]
             key = wb_keys[index]
             row["compare_status"] = "green"
             consumed_counts[key] += 1
+
+        external_indices_by_key = {}
+        for external_index, key in enumerate(external_keys):
+            external_indices_by_key.setdefault(key, []).append(external_index)
+
+        def claim_external_index_for_key(key):
+            indices = external_indices_by_key.get(key, [])
+            for external_index in indices:
+                if external_index not in used_external_indices:
+                    used_external_indices.add(external_index)
+                    return external_index
+            return None
 
         for index, row in enumerate(wb_rows):
             if row.get("compare_status") == "green":
@@ -640,8 +1392,43 @@ class WabbajackGuideApp:
             if consumed_counts[key] < external_counts[key]:
                 row["compare_status"] = "yellow"
                 consumed_counts[key] += 1
+                external_index = claim_external_index_for_key(key)
+                if external_index is not None:
+                    wb_to_external_index[index] = external_index
             else:
                 row["compare_status"] = "red"
+
+        consumed_pairs = sorted((external_index, wb_index) for wb_index, external_index in wb_to_external_index.items())
+        consumed_external_indices = [pair[0] for pair in consumed_pairs]
+
+        external_only = []
+        for external_index, (raw_name, _key) in enumerate(external_name_key_pairs):
+            if external_index in used_external_indices:
+                continue
+
+            insert_pos = bisect_left(consumed_external_indices, external_index)
+            prev_wb_index = consumed_pairs[insert_pos - 1][1] if insert_pos > 0 else None
+            next_wb_index = consumed_pairs[insert_pos][1] if insert_pos < len(consumed_pairs) else None
+
+            if prev_wb_index is not None and next_wb_index is not None:
+                insert_index = max(prev_wb_index + 1, 0)
+                insert_index = min(insert_index, next_wb_index)
+            elif prev_wb_index is not None:
+                insert_index = prev_wb_index + 1
+            elif next_wb_index is not None:
+                insert_index = next_wb_index
+            else:
+                insert_index = len(wb_rows)
+
+            external_only.append(
+                {
+                    "name": raw_name,
+                    "insert_index": int(insert_index),
+                    "external_index": external_index,
+                }
+            )
+
+        self.external_only_compare_names = external_only
 
         self.external_compare_path = file_path
         self.apply_filters_and_sort()
@@ -649,12 +1436,18 @@ class WabbajackGuideApp:
 
         if hasattr(self, "clear_compare_button"):
             self.clear_compare_button.config(state=tk.NORMAL)
+        if hasattr(self, "show_external_only_button"):
+            has_external_only = self.has_external_only_rows()
+            self.show_external_only_button.config(state=tk.NORMAL if has_external_only else tk.DISABLED)
+            if not has_external_only:
+                self.show_external_only_var.set(False)
 
         green_count = sum(1 for row in self.mod_rows if row.get("compare_status") == "green")
         yellow_count = sum(1 for row in self.mod_rows if row.get("compare_status") == "yellow")
         red_count = sum(1 for row in self.mod_rows if row.get("compare_status") == "red")
+        external_only_count = len(self.external_only_compare_names)
         self.set_status(
-            f"External compare: {green_count} green, {yellow_count} yellow, {red_count} red"
+            f"External compare: {green_count} green, {yellow_count} yellow, {red_count} red, {external_only_count} external-only"
         )
 
     def clear_compare_colors(self):
@@ -662,12 +1455,17 @@ class WabbajackGuideApp:
         for row in self.mod_rows:
             row["compare_status"] = None
 
+        self.external_only_compare_names = []
         self.external_compare_path = None
+        if hasattr(self, "show_external_only_var"):
+            self.show_external_only_var.set(False)
         self.apply_filters_and_sort()
         self.update_legend_visibility()
 
         if hasattr(self, "clear_compare_button"):
             self.clear_compare_button.config(state=tk.DISABLED)
+        if hasattr(self, "show_external_only_button"):
+            self.show_external_only_button.config(state=tk.DISABLED)
 
         self.set_status("Compare colors cleared")
 
@@ -699,6 +1497,7 @@ class WabbajackGuideApp:
                 "raw_name": row.get("raw_name"),
                 "folder_key": row.get("folder_key", ""),
                 "active": row.get("active", True),
+                "activation_state": row.get("activation_state", "active" if row.get("active", True) else "inactive"),
                 "is_separator": row.get("is_separator", False),
                 "author": row.get("author", ""),
                 "version": row.get("version", ""),
@@ -775,6 +1574,7 @@ class WabbajackGuideApp:
                 self.mod_folder_meta_paths = {}
                 self.mod_folder_files = {}
                 self.mod_folder_archive_hashes = {}
+                self.synthetic_archive_by_hash = {}
                 self.inline_file_sources = {}
                 self.inline_text_cache = {}
 
@@ -975,6 +1775,7 @@ class WabbajackGuideApp:
         folder_key = str(folder_name).strip().lower()
         archive_hashes = list(self.mod_folder_archive_hashes.get(folder_key, []))
         archives = [self.archive_by_hash[archive_hash] for archive_hash in archive_hashes if archive_hash in self.archive_by_hash]
+        embedded_archives = [self.synthetic_archive_by_hash[archive_hash] for archive_hash in archive_hashes if archive_hash in self.synthetic_archive_by_hash]
 
         installation_file = meta.get("installation_file", "") if meta else ""
         if installation_file:
@@ -984,7 +1785,42 @@ class WabbajackGuideApp:
                         archives.insert(0, archives.pop(index))
                     break
 
-        return archives
+        return archives + embedded_archives
+
+    def build_inline_archive_record(self, inline_hash, total_size=0):
+        """Build a synthetic archive record for InlineFile payloads embedded in the .wabbajack."""
+        folder_key = inline_hash.replace(self.INLINE_SOURCE_PREFIX, "", 1)
+        display_folder = folder_key if folder_key else "mod folder"
+        return {
+            "Hash": inline_hash,
+            "Name": f"Embedded files in .wabbajack ({display_folder})",
+            "Size": int(total_size or 0),
+            "State": {
+                "$type": "InlineFile, EmbeddedInWabbajack",
+                "Name": "Embedded in .wabbajack",
+            },
+        }
+
+    def resolve_archive_reference(self, archive_hash, file_list=None):
+        """Resolve archive hashes from real archives or synthetic embedded InlineFile sources."""
+        if not archive_hash:
+            return None
+        if archive_hash in self.archive_by_hash:
+            return self.archive_by_hash[archive_hash]
+        if archive_hash in self.synthetic_archive_by_hash:
+            return self.synthetic_archive_by_hash[archive_hash]
+        if archive_hash.startswith(self.INLINE_SOURCE_PREFIX):
+            total_size = 0
+            if file_list:
+                total_size = sum(
+                    int(file_info.get("size", 0))
+                    for file_info in file_list
+                    if file_info.get("archive_hash", "") == archive_hash
+                )
+            archive = self.build_inline_archive_record(archive_hash, total_size=total_size)
+            self.synthetic_archive_by_hash[archive_hash] = archive
+            return archive
+        return None
 
     @staticmethod
     def count_files_by_archive(file_list):
@@ -1127,11 +1963,19 @@ class WabbajackGuideApp:
 
         if hasattr(self, "export_modlist_button"):
             self.export_modlist_button.config(state=tk.NORMAL if self.mod_rows else tk.DISABLED)
+        if hasattr(self, "export_separators_button"):
+            has_separators = bool(self.get_separator_folder_names()) if self.mod_rows else False
+            self.export_separators_button.config(state=tk.NORMAL if has_separators else tk.DISABLED)
         if hasattr(self, "compare_modlist_button"):
             self.compare_modlist_button.config(state=tk.NORMAL if self.mod_rows else tk.DISABLED)
         if hasattr(self, "clear_compare_button"):
             has_compare = self.has_active_compare_colors()
             self.clear_compare_button.config(state=tk.NORMAL if has_compare else tk.DISABLED)
+        if hasattr(self, "show_external_only_button"):
+            has_external_only = self.has_external_only_rows()
+            self.show_external_only_button.config(state=tk.NORMAL if has_external_only else tk.DISABLED)
+            if not has_external_only:
+                self.show_external_only_var.set(False)
         self.update_legend_visibility()
 
         if hasattr(self, "status_var"):
@@ -1157,39 +2001,64 @@ class WabbajackGuideApp:
             self.info_toggle_button.config(text="Hide Modlist Info")
 
     def process_directives(self):
-        """Process archive-backed directives and index folder-level source relationships."""
+        """Process archive-backed and embedded directives for folder-level source relationships."""
         total = len(self.directives)
         for index, directive in enumerate(self.directives, start=1):
-            if directive.get("$type") not in self.SOURCE_DIRECTIVE_TYPES:
+            directive_type = directive.get("$type")
+            if directive_type not in self.SOURCE_DIRECTIVE_TYPES and directive_type != "InlineFile":
                 continue
 
             if index % 2500 == 0:
                 self.set_status(f"Processing directives: {index}/{total}")
 
-            archive_hash = (
-                directive.get("ArchiveHashPath", [""])[0]
-                if directive.get("ArchiveHashPath")
-                else ""
-            )
-            archive_path = (
-                directive.get("ArchiveHashPath", ["", ""])[1]
-                if len(directive.get("ArchiveHashPath", [])) > 1
-                else ""
-            )
+            archive_hash = ""
+            archive_path = ""
+            source_data_id = ""
+            if directive_type in self.SOURCE_DIRECTIVE_TYPES:
+                archive_hash = (
+                    directive.get("ArchiveHashPath", [""])[0]
+                    if directive.get("ArchiveHashPath")
+                    else ""
+                )
+                archive_path = (
+                    directive.get("ArchiveHashPath", ["", ""])[1]
+                    if len(directive.get("ArchiveHashPath", [])) > 1
+                    else ""
+                )
+            elif directive_type == "InlineFile":
+                source_data_id = str(directive.get("SourceDataID", "")).strip()
+                if not source_data_id:
+                    continue
+                archive_path = f"[Embedded InlineFile] {source_data_id}"
 
             target_path = str(directive.get("To", "")).replace("/", "\\")
             if target_path.lower().startswith("mods\\"):
+                if self.is_mod_meta_file_path(target_path):
+                    continue
                 parts = target_path.split("\\")
                 if len(parts) >= 2:
                     folder_name = parts[1].strip().lower()
                     if folder_name:
+                        if directive_type == "InlineFile":
+                            archive_hash = f"{self.INLINE_SOURCE_PREFIX}{folder_name}"
+                            if archive_hash not in self.synthetic_archive_by_hash:
+                                self.synthetic_archive_by_hash[archive_hash] = self.build_inline_archive_record(
+                                    archive_hash,
+                                    total_size=directive.get("Size", 0),
+                                )
+                            else:
+                                self.synthetic_archive_by_hash[archive_hash]["Size"] = int(
+                                    self.synthetic_archive_by_hash[archive_hash].get("Size", 0)
+                                ) + int(directive.get("Size", 0) or 0)
+
                         self.mod_folder_files.setdefault(folder_name, []).append(
                             {
                                 "target_path": target_path,
                                 "archive_path": archive_path,
                                 "archive_hash": archive_hash,
+                                "source_data_id": source_data_id,
                                 "size": directive.get("Size", 0),
-                                "directive_type": directive.get("$type", ""),
+                                "directive_type": directive_type or "",
                             }
                         )
                         folder_hashes = self.mod_folder_archive_hashes.setdefault(folder_name, [])
@@ -1202,8 +2071,8 @@ class WabbajackGuideApp:
         entries = []
 
         for line in lines:
-            prefix = line[0] if line and line[0] in "+-" else "+"
-            raw_name = line[1:].strip() if line and line[0] in "+-" else line
+            prefix = line[0] if line and line[0] in "+-*" else "+"
+            raw_name = line[1:].strip() if line and line[0] in "+-*" else line
             is_separator = raw_name.lower().endswith("_separator")
             display_name = raw_name[:-10] if is_separator else raw_name
 
@@ -1212,7 +2081,8 @@ class WabbajackGuideApp:
                     "raw_line": line,
                     "name": display_name,
                     "raw_name": raw_name,
-                    "active": prefix == "+",
+                    "active": prefix in "+*",
+                    "activation_state": self.get_activation_state_from_prefix(prefix),
                     "is_separator": is_separator,
                 }
             )
@@ -1224,6 +2094,10 @@ class WabbajackGuideApp:
     def prepare_mod_rows(self):
         """Build table rows from profile modlist order, with archive metadata if available."""
         self.mod_rows = []
+        self.external_only_compare_names = []
+        self.external_compare_path = None
+        if hasattr(self, "show_external_only_var"):
+            self.show_external_only_var.set(False)
 
         if self.profile_modlist_text:
             parsed_entries = self.parse_modlist_entries(self.profile_modlist_text)
@@ -1260,6 +2134,7 @@ class WabbajackGuideApp:
                         "raw_name": entry["raw_name"],
                         "folder_key": folder_key,
                         "active": entry["active"],
+                        "activation_state": entry.get("activation_state", "active"),
                         "is_separator": entry["is_separator"],
                         "author": author,
                         "version": version,
@@ -1287,6 +2162,7 @@ class WabbajackGuideApp:
                         "name": name,
                         "raw_name": name,
                         "active": True,
+                        "activation_state": "active",
                         "is_separator": False,
                         "author": state.get("Author", "Unknown"),
                         "version": state.get("Version", ""),
@@ -1328,12 +2204,15 @@ class WabbajackGuideApp:
 
         load_button = ttk.Button(button_frame, text="Load Wabbajack File", command=self.load_wabbajack_file)
         self.header_toolbar_widgets.append((load_button, (0, 8)))
+        self.add_tooltip(load_button, "Open a .wabbajack file and build the mod list from its embedded data.")
 
         load_cache_button = ttk.Button(button_frame, text="Load Modlist", command=self.load_saved_modlist)
         self.header_toolbar_widgets.append((load_cache_button, (0, 8)))
+        self.add_tooltip(load_cache_button, "Load a saved viewer snapshot instead of rereading the archive.")
 
         save_cache_button = ttk.Button(button_frame, text="Save Modlist", command=self.save_modlist)
         self.header_toolbar_widgets.append((save_cache_button, (0, 8)))
+        self.add_tooltip(save_cache_button, "Save the current loaded data to a compact snapshot file.")
 
         self.info_toggle_button = ttk.Button(
             button_frame,
@@ -1341,6 +2220,7 @@ class WabbajackGuideApp:
             command=self.toggle_modlist_info,
         )
         self.header_toolbar_widgets.append((self.info_toggle_button, (0, 8)))
+        self.add_tooltip(self.info_toggle_button, "Show or hide the modlist metadata pane.")
 
         self.export_modlist_button = ttk.Button(
             button_frame,
@@ -1349,6 +2229,16 @@ class WabbajackGuideApp:
             state=tk.DISABLED,
         )
         self.header_toolbar_widgets.append((self.export_modlist_button, (0, 8)))
+        self.add_tooltip(self.export_modlist_button, "Export the current load order as an MO2 modlist.txt file.")
+
+        self.export_separators_button = ttk.Button(
+            button_frame,
+            text="Export Separators",
+            command=self.export_separators_zip,
+            state=tk.DISABLED,
+        )
+        self.header_toolbar_widgets.append((self.export_separators_button, (0, 8)))
+        self.add_tooltip(self.export_separators_button, "Export separator folders as an empty zip scaffold.")
 
         self.compare_modlist_button = ttk.Button(
             button_frame,
@@ -1357,6 +2247,7 @@ class WabbajackGuideApp:
             state=tk.DISABLED,
         )
         self.header_toolbar_widgets.append((self.compare_modlist_button, (0, 8)))
+        self.add_tooltip(self.compare_modlist_button, "Compare the loaded list with an external modlist.txt.")
 
         self.clear_compare_button = ttk.Button(
             button_frame,
@@ -1365,14 +2256,28 @@ class WabbajackGuideApp:
             state=tk.DISABLED,
         )
         self.header_toolbar_widgets.append((self.clear_compare_button, (0, 8)))
+        self.add_tooltip(self.clear_compare_button, "Clear compare coloring and restore the normal view.")
+
+        self.show_external_only_var = tk.BooleanVar(value=False)
+        self.show_external_only_button = ttk.Checkbutton(
+            button_frame,
+            text="Show External-Only",
+            variable=self.show_external_only_var,
+            command=self.on_toggle_show_external_only,
+            state=tk.DISABLED,
+        )
+        self.header_toolbar_widgets.append((self.show_external_only_button, (0, 8)))
+        self.add_tooltip(self.show_external_only_button, "Show mods that only exist in the external comparison list.")
 
         self.profile_label = ttk.Label(button_frame, text="Profile:")
         self.header_toolbar_widgets.append((self.profile_label, (8, 2)))
+        self.add_tooltip(self.profile_label, "Choose which profile folder inside the archive to load.")
         self.profile_var = tk.StringVar()
         self.profile_combobox = ttk.Combobox(
             button_frame, textvariable=self.profile_var, state="readonly", width=20
         )
         self.header_toolbar_widgets.append((self.profile_combobox, (0, 8)))
+        self.add_tooltip(self.profile_combobox, "Select a different Wabbajack profile from the archive.")
         self.profile_combobox.bind("<<ComboboxSelected>>", self.on_profile_selected)
         self.profile_combobox.config(state=tk.DISABLED)
 
@@ -1385,6 +2290,7 @@ class WabbajackGuideApp:
                 state=tk.DISABLED,
             )
             self.header_toolbar_widgets.append((button, (0, 8)))
+            self.add_tooltip(button, f"Open the embedded {ini_name} from the loaded Wabbajack data.")
             self.ini_buttons[ini_name] = button
 
         self.layout_header_buttons()
@@ -1418,6 +2324,7 @@ class WabbajackGuideApp:
         tk.Label(self.legend_frame, text="Green = in external and in order", fg="#1f7a1f").pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(self.legend_frame, text="Yellow = in external but wrong order", fg="#b8860b").pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(self.legend_frame, text="Red = missing from external", fg="#b22222").pack(side=tk.LEFT)
+        tk.Label(self.legend_frame, text="Blue = external-only (not in Wabbajack)", fg="#1f4d99").pack(side=tk.LEFT, padx=(8, 0))
         self.legend_frame.grid_remove()
 
         paned_window = ttk.PanedWindow(content_frame, orient=tk.VERTICAL)
@@ -1429,13 +2336,13 @@ class WabbajackGuideApp:
 
         self.tree = ttk.Treeview(
             mod_frame,
-            columns=("active", "name", "links", "author", "version", "size"),
+            columns=("active", "name", "sources", "author", "version", "size"),
             show="tree headings",
         )
         self.tree.heading("#0", text="#", command=lambda: self.sort_by("number"))
         self.tree.heading("active", text="Active", command=lambda: self.sort_by("active"))
         self.tree.heading("name", text="Mod Name", command=lambda: self.sort_by("name"))
-        self.tree.heading("links", text="Links", command=lambda: self.sort_by("links"))
+        self.tree.heading("sources", text="Sources", command=lambda: self.sort_by("sources"))
         self.tree.heading("author", text="Author", command=lambda: self.sort_by("author"))
         self.tree.heading("version", text="Version", command=lambda: self.sort_by("version"))
         self.tree.heading("size", text="Size (MB)", command=lambda: self.sort_by("size"))
@@ -1443,7 +2350,7 @@ class WabbajackGuideApp:
         self.tree.column("#0", width=50, minwidth=40, anchor=tk.CENTER, stretch=False)
         self.tree.column("active", width=55, minwidth=50, anchor=tk.CENTER, stretch=False)
         self.tree.column("name", width=330, minwidth=180)
-        self.tree.column("links", width=55, minwidth=45, anchor=tk.CENTER, stretch=False)
+        self.tree.column("sources", width=70, minwidth=55, anchor=tk.CENTER, stretch=False)
         self.tree.column("author", width=130, minwidth=80)
         self.tree.column("version", width=80, minwidth=50)
         self.tree.column("size", width=70, minwidth=55, anchor=tk.E, stretch=False)
@@ -1460,6 +2367,7 @@ class WabbajackGuideApp:
         self.tree.tag_configure("compare_green", foreground="#1f7a1f")
         self.tree.tag_configure("compare_yellow", foreground="#b8860b")
         self.tree.tag_configure("compare_red", foreground="#b22222")
+        self.tree.tag_configure("compare_external_only", foreground="#1f4d99")
 
         details_frame = ttk.LabelFrame(paned_window, text="Mod Details", padding="10")
         details_frame.columnconfigure(0, weight=1)
@@ -1488,17 +2396,25 @@ class WabbajackGuideApp:
         self.sources_search_var = tk.StringVar()
         self.sources_search_var.trace("w", self.on_sources_search_changed)
         ttk.Entry(sources_search_frame, textvariable=self.sources_search_var, width=48).pack(side=tk.LEFT)
+        self.sources_hide_mohidden_var = tk.BooleanVar(value=False)
+        self.sources_hide_mohidden_check = ttk.Checkbutton(
+            sources_search_frame,
+            text="Hide .mohidden",
+            variable=self.sources_hide_mohidden_var,
+            command=self.on_sources_filter_changed,
+        )
+        self.sources_hide_mohidden_check.pack(side=tk.LEFT, padx=(12, 0))
 
         self.sources_tree = ttk.Treeview(
             sources_frame,
             columns=("target_path", "source_path", "size", "kind"),
             show="tree headings",
         )
-        self.sources_tree.heading("#0", text="Source Archive")
-        self.sources_tree.heading("target_path", text="Install Path")
-        self.sources_tree.heading("source_path", text="Source Path")
-        self.sources_tree.heading("size", text="Size (bytes)")
-        self.sources_tree.heading("kind", text="Directive")
+        self.sources_tree.heading("#0", text="Source Archive", command=lambda: self.on_sources_sort_requested("source"))
+        self.sources_tree.heading("target_path", text="Install Path", command=lambda: self.on_sources_sort_requested("target_path"))
+        self.sources_tree.heading("source_path", text="Source Path", command=lambda: self.on_sources_sort_requested("source_path"))
+        self.sources_tree.heading("size", text="Size (bytes)", command=lambda: self.on_sources_sort_requested("size"))
+        self.sources_tree.heading("kind", text="Directive", command=lambda: self.on_sources_sort_requested("kind"))
 
         self.sources_tree.column("#0", width=260, minwidth=180)
         self.sources_tree.column("target_path", width=360, minwidth=240)
@@ -1525,12 +2441,20 @@ class WabbajackGuideApp:
         self.files_search_var = tk.StringVar()
         self.files_search_var.trace("w", self.on_files_search_changed)
         ttk.Entry(files_search_frame, textvariable=self.files_search_var, width=48).pack(side=tk.LEFT)
+        self.files_hide_mohidden_var = tk.BooleanVar(value=False)
+        self.files_hide_mohidden_check = ttk.Checkbutton(
+            files_search_frame,
+            text="Hide .mohidden",
+            variable=self.files_hide_mohidden_var,
+            command=self.on_files_filter_changed,
+        )
+        self.files_hide_mohidden_check.pack(side=tk.LEFT, padx=(12, 0))
 
         self.files_tree = ttk.Treeview(files_frame, columns=("source_mod", "source_path", "size"), show="tree headings")
-        self.files_tree.heading("#0", text="Target Path")
-        self.files_tree.heading("source_mod", text="Source Mod")
-        self.files_tree.heading("source_path", text="Source Path")
-        self.files_tree.heading("size", text="Size (bytes)")
+        self.files_tree.heading("#0", text="Target Path", command=lambda: self.on_files_sort_requested("target_path"))
+        self.files_tree.heading("source_mod", text="Source Mod", command=lambda: self.on_files_sort_requested("source_mod"))
+        self.files_tree.heading("source_path", text="Source Path", command=lambda: self.on_files_sort_requested("source_path"))
+        self.files_tree.heading("size", text="Size (bytes)", command=lambda: self.on_files_sort_requested("size"))
 
         self.files_tree.column("#0", width=300, minwidth=200)
         self.files_tree.column("source_mod", width=210, minwidth=140)
@@ -1543,6 +2467,9 @@ class WabbajackGuideApp:
         self.files_tree.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         files_scroll.grid(row=1, column=1, sticky=(tk.N, tk.S))
 
+        self.add_tooltip(self.sources_hide_mohidden_check, "Hide source file entries whose path ends with .mohidden.")
+        self.add_tooltip(self.files_hide_mohidden_check, "Hide file entries whose path ends with .mohidden.")
+
         files_frame.columnconfigure(0, weight=1)
         files_frame.rowconfigure(1, weight=1)
 
@@ -1551,8 +2478,11 @@ class WabbajackGuideApp:
 
         self.tree.bind("<<TreeviewSelect>>", self.on_mod_select)
         self.tree.bind("<Button-3>", self.on_mod_right_click)
+        self.tree.bind("<Control-c>", self.copy_tree_selection)
+        self.tree.bind("<Control-C>", self.copy_tree_selection)
 
         self.populate_mod_list()
+        self.update_sort_indicators()
 
         status_frame = ttk.Frame(main_frame)
         status_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
@@ -1612,7 +2542,33 @@ class WabbajackGuideApp:
 
     def has_active_compare_colors(self):
         """Return True when any row currently has a compare color status."""
-        return any(row.get("compare_status") in {"green", "yellow", "red"} for row in self.mod_rows)
+        return any(row.get("compare_status") in {"green", "yellow", "red"} for row in self.mod_rows) or bool(self.external_only_compare_names)
+
+    def has_external_only_rows(self):
+        """Return True when compare has unmatched external entries."""
+        return bool(self.external_only_compare_names)
+
+    def on_toggle_show_external_only(self):
+        """Re-render list when the external-only visibility toggle changes."""
+        if self.show_external_only_var.get() and self.has_external_only_rows():
+            if self.sort_state_before_external_only is None:
+                self.sort_state_before_external_only = (self.sort_column, self.sort_reverse)
+            self.sort_column = "number"
+            self.sort_reverse = False
+            self.set_status("Sorting is locked while Show External-Only is enabled (showing compare placement order).")
+        else:
+            if self.sort_state_before_external_only is not None:
+                self.sort_column, self.sort_reverse = self.sort_state_before_external_only
+                self.sort_state_before_external_only = None
+        self.apply_filters_and_sort()
+
+    def is_external_only_sort_locked(self):
+        """Return True when sort changes should be blocked to preserve compare placement."""
+        return bool(
+            getattr(self, "show_external_only_var", None)
+            and self.show_external_only_var.get()
+            and self.has_external_only_rows()
+        )
 
     def update_legend_visibility(self):
         """Show legend only when compare colors are active."""
@@ -1676,25 +2632,125 @@ class WabbajackGuideApp:
         """Apply text filter and sorting, then render list rows."""
         search_text = self.search_var.get().lower().strip()
 
-        rows = self.mod_rows
-        if search_text:
-            rows = [
-                row
-                for row in rows
-                if search_text in (row["name"] or "").lower()
+        rows = list(self.mod_rows)
+        showing_external_only = bool(
+            getattr(self, "show_external_only_var", None)
+            and self.show_external_only_var.get()
+            and self.external_only_compare_names
+        )
+        if showing_external_only and (self.sort_column != "number" or self.sort_reverse):
+            self.sort_column = "number"
+            self.sort_reverse = False
+        external_render_order = {}
+        if showing_external_only:
+            inserts_by_index = {}
+            for entry in self.external_only_compare_names:
+                insert_index = int(entry.get("insert_index", len(self.mod_rows)))
+                inserts_by_index.setdefault(insert_index, []).append(entry)
+
+            interleaved_rows = []
+            wb_index = 0
+            external_counter = 0
+            for row in self.mod_rows:
+                if not row.get("is_separator"):
+                    pending_entries = inserts_by_index.get(wb_index, [])
+                    for entry in pending_entries:
+                        external_counter += 1
+                        name = str(entry.get("name", ""))
+                        display_name, is_separator = self.parse_external_entry_name(name)
+                        interleaved_rows.append(
+                            {
+                                "number": f"E{external_counter}",
+                                "name": display_name,
+                                "raw_name": name,
+                                "folder_key": self.normalize_mod_key(name),
+                                "active": False,
+                                "is_separator": is_separator,
+                                "author": "-",
+                                "version": "",
+                                "size_mb": "",
+                                "direct_link_count": 0,
+                                "archive_hash": "",
+                                "archive_name": "",
+                                "archive": None,
+                                "folder_meta": {},
+                                "source_archives": [],
+                                "folder_files": [],
+                                "source_file_counts": {},
+                                "compare_status": "external_only",
+                                "external_only": True,
+                            }
+                        )
+                    wb_index += 1
+
+                interleaved_rows.append(row)
+
+            for entry in inserts_by_index.get(wb_index, []):
+                external_counter += 1
+                name = str(entry.get("name", ""))
+                display_name, is_separator = self.parse_external_entry_name(name)
+                interleaved_rows.append(
+                    {
+                        "number": f"E{external_counter}",
+                        "name": display_name,
+                        "raw_name": name,
+                        "folder_key": self.normalize_mod_key(name),
+                        "active": False,
+                        "is_separator": is_separator,
+                        "author": "-",
+                        "version": "",
+                        "size_mb": "",
+                        "direct_link_count": 0,
+                        "archive_hash": "",
+                        "archive_name": "",
+                        "archive": None,
+                        "folder_meta": {},
+                        "source_archives": [],
+                        "folder_files": [],
+                        "source_file_counts": {},
+                        "compare_status": "external_only",
+                        "external_only": True,
+                    }
+                )
+
+            for index, row in enumerate(interleaved_rows):
+                external_render_order[id(row)] = index
+            rows = interleaved_rows
+
+        def row_matches_search(row):
+            if not search_text:
+                return True
+            return (
+                search_text in (row["name"] or "").lower()
                 or search_text in (row["author"] or "").lower()
                 or search_text in (row["archive_name"] or "").lower()
-            ]
+            )
 
         def sort_key(item):
             if self.sort_column == "number":
-                return item.get("number", 0)
+                if showing_external_only:
+                    return external_render_order.get(id(item), 0)
+                number = item.get("number", 0)
+                if isinstance(number, str) and number.startswith("E"):
+                    try:
+                        return (1, int(number[1:]))
+                    except Exception:
+                        return (1, 0)
+                try:
+                    return (0, int(number))
+                except Exception:
+                    return (0, 0)
             if self.sort_column == "active":
-                return 1 if item.get("active") else 0
+                state = item.get("activation_state") or ("active" if item.get("active") else "inactive")
+                if state == "always":
+                    return 2
+                if state == "active":
+                    return 1
+                return 0
             if self.sort_column == "name":
                 return str(item.get("name", "")).lower()
-            if self.sort_column == "links":
-                return int(item.get("direct_link_count", 0))
+            if self.sort_column == "sources":
+                return len(item.get("source_archives", []))
             if self.sort_column == "author":
                 return str(item.get("author", "")).lower()
             if self.sort_column == "version":
@@ -1706,33 +2762,92 @@ class WabbajackGuideApp:
                     return 0.0
             return item.get("number", 0)
 
-        rows = sorted(rows, key=sort_key, reverse=self.sort_reverse)
+        if self.sort_column == "number" or showing_external_only:
+            sections = []
+            current_header = None
+            current_children = []
+            current_header_visible = False
+
+            def flush_section():
+                nonlocal current_header, current_children, current_header_visible
+                if current_header is None and not current_children:
+                    return
+                if current_header is None:
+                    section_header = None
+                elif current_header_visible or current_children:
+                    section_header = current_header
+                else:
+                    section_header = None
+                sections.append((section_header, list(current_children)))
+                current_header = None
+                current_children = []
+                current_header_visible = False
+
+            for row in rows:
+                if row["is_separator"]:
+                    flush_section()
+                    current_header = row if row_matches_search(row) else row
+                    current_header_visible = row_matches_search(row)
+                    continue
+
+                if row_matches_search(row):
+                    current_children.append(row)
+
+            flush_section()
+        else:
+            filtered_rows = [row for row in rows if row_matches_search(row)]
+            sections = [(None, sorted(filtered_rows, key=sort_key, reverse=self.sort_reverse))]
 
         self.tree.delete(*self.tree.get_children())
         self.row_by_item_id = {}
 
-        for row in rows:
-            active_mark = "" if row["is_separator"] else ("[x]" if row["active"] else "[ ]")
-            links_value = "" if row["is_separator"] else str(row.get("direct_link_count", 0))
-            values = (active_mark, row["name"], links_value, row["author"], row["version"], row["size_mb"])
-            tags = ["separator"] if row["is_separator"] else []
+        visible_count = 0
+        for header, children in sections:
+            if header is None:
+                parent_id = ""
+            else:
+                active_mark = self.get_activation_mark_for_row(header)
+                values = (active_mark, header["name"], "", header["author"], header["version"], header["size_mb"])
+                tags = ["separator"]
+                compare_status = header.get("compare_status")
+                if compare_status == "green":
+                    tags.append("compare_green")
+                elif compare_status == "yellow":
+                    tags.append("compare_yellow")
+                elif compare_status == "red":
+                    tags.append("compare_red")
+                elif compare_status == "external_only":
+                    tags.append("compare_external_only")
+                if header["archive_hash"]:
+                    tags.append(header["archive_hash"])
+                parent_id = self.tree.insert("", "end", text=str(header["number"]), values=values, tags=tuple(tags), open=True)
+                self.row_by_item_id[parent_id] = header
+                visible_count += 1
 
-            compare_status = row.get("compare_status")
-            if compare_status == "green":
-                tags.append("compare_green")
-            elif compare_status == "yellow":
-                tags.append("compare_yellow")
-            elif compare_status == "red":
-                tags.append("compare_red")
+            for row in children:
+                active_mark = self.get_activation_mark_for_row(row)
+                sources_value = "" if row["is_separator"] else str(len(row.get("source_archives", [])))
+                values = (active_mark, row["name"], sources_value, row["author"], row["version"], row["size_mb"])
+                tags = ["separator"] if row["is_separator"] else []
 
-            if row["archive_hash"]:
-                tags.append(row["archive_hash"])
+                compare_status = row.get("compare_status")
+                if compare_status == "green":
+                    tags.append("compare_green")
+                elif compare_status == "yellow":
+                    tags.append("compare_yellow")
+                elif compare_status == "red":
+                    tags.append("compare_red")
+                elif compare_status == "external_only":
+                    tags.append("compare_external_only")
 
-            item_id = self.tree.insert("", "end", text=str(row["number"]), values=values, tags=tuple(tags))
-            self.row_by_item_id[item_id] = row
+                if row["archive_hash"]:
+                    tags.append(row["archive_hash"])
 
-        visible_count = len(rows)
-        total_count = len(self.mod_rows)
+                item_id = self.tree.insert(parent_id, "end", text=str(row["number"]), values=values, tags=tuple(tags))
+                self.row_by_item_id[item_id] = row
+                visible_count += 1
+
+        total_count = len(self.mod_rows) + (len(self.external_only_compare_names) if showing_external_only else 0)
         if hasattr(self, "status_var"):
             if self.active_profile:
                 profile_name = self.active_profile.split("\\")[-1]
@@ -1740,8 +2855,13 @@ class WabbajackGuideApp:
             else:
                 self.status_var.set(f"Showing {visible_count} of {total_count} entries")
 
+        self.update_sort_indicators()
+
     def sort_by(self, column):
         """Sort list by number or name."""
+        if self.is_external_only_sort_locked():
+            self.set_status("Sorting is disabled while Show External-Only is enabled.")
+            return
         if column == self.sort_column:
             self.sort_reverse = not self.sort_reverse
         else:
@@ -1758,8 +2878,18 @@ class WabbajackGuideApp:
         if self.current_selected_row:
             self.update_sources_tab(self.current_selected_row)
 
+    def on_sources_filter_changed(self):
+        """Rebuild sources tab when the hide .mohidden option changes."""
+        if self.current_selected_row:
+            self.update_sources_tab(self.current_selected_row)
+
     def on_files_search_changed(self, *args):
         """Rebuild files tab with current filter text."""
+        if self.current_selected_row:
+            self.update_files_tab(self.current_selected_row)
+
+    def on_files_filter_changed(self):
+        """Rebuild files tab when the hide .mohidden option changes."""
         if self.current_selected_row:
             self.update_files_tab(self.current_selected_row)
 
@@ -1791,6 +2921,20 @@ class WabbajackGuideApp:
             self.notebook.select(0)
             return
 
+        if row.get("external_only"):
+            overview = (
+                f"Mod Name: {row['name']}\n"
+                f"Order: {row['number']}\n"
+                "\n"
+                "This mod exists in the external modlist but not in the loaded Wabbajack modlist."
+            )
+            self.overview_text.insert(1.0, overview)
+            self.update_sources_tab(row)
+            self.files_tree.delete(*self.files_tree.get_children())
+            self.files_tree.insert("", "end", text="No file details available for external-only entries.")
+            self.notebook.select(0)
+            return
+
         archive = row.get("archive")
         folder_meta = row.get("folder_meta", {})
         source_archives = row.get("source_archives", [])
@@ -1799,7 +2943,7 @@ class WabbajackGuideApp:
             overview = (
                 f"Mod Name: {row['name']}\n"
                 f"Order: {row['number']}\n"
-                f"Active: {'Yes' if row['active'] else 'No'}\n\n"
+                f"Active: {self.get_activation_label_for_row(row)}\n\n"
                 "No matching archive metadata was found for this modlist entry."
             )
             self.overview_text.insert(1.0, overview)
@@ -1810,7 +2954,8 @@ class WabbajackGuideApp:
             return
 
         state = archive.get("State", {}) if archive else {}
-        filename = archive.get("Name", folder_meta.get("installation_file", row["raw_name"])) if archive else folder_meta.get("installation_file", row["raw_name"])
+        installation_file_meta = folder_meta.get("installation_file", "")
+        filename = installation_file_meta or (archive.get("Name", row["raw_name"]) if archive else row["raw_name"])
         mod_author = state.get("Author", "Unknown") if archive else "Unknown"
         mod_description = state.get("Description", "") if archive else ""
         mod_version = folder_meta.get("version") or state.get("Version", "")
@@ -1820,9 +2965,11 @@ class WabbajackGuideApp:
         overview = f"Mod Folder: {row['raw_name']}\n"
         overview += f"Display Name: {row['name']}\n"
         overview += f"Order: {row['number']}\n"
-        overview += f"Active: {'Yes' if row['active'] else 'No'}\n"
+        overview += f"Active: {self.get_activation_label_for_row(row)}\n"
         overview += f"Primary Source: {actual_mod_name}\n"
-        overview += f"Installation File: {filename}\n"
+        overview += f"Installation File (meta.ini): {filename}\n"
+        if installation_file_meta:
+            overview += "Note: meta.ini installation file is metadata and is not counted as a source archive.\n"
         overview += f"Author: {mod_author}\n"
         if mod_version:
             overview += f"Version: {mod_version}\n"
@@ -1843,7 +2990,7 @@ class WabbajackGuideApp:
             )
             source_file_counts = row.get("source_file_counts", {})
             overview += f"Direct Links Available: {direct_links_total}\n"
-            overview += f"Source Archives: {len(source_archives)}\n\n"
+            overview += f"Sources: {len(source_archives)}\n\n"
             for index, source_archive in enumerate(source_archives, start=1):
                 source_state = source_archive.get("State", {})
                 links = self.build_archive_links(source_archive)
@@ -1851,7 +2998,11 @@ class WabbajackGuideApp:
                 file_count = source_file_counts.get(source_archive.get("Hash", ""), 0)
                 overview += f"Source {index}: {source_name}\n"
                 overview += f"Files Contributed: {file_count}\n"
-                overview += f"Archive File: {source_archive.get('Name', '')}\n"
+                overview += f"Archive File (directive->Archives.Name): {source_archive.get('Name', '')}\n"
+                if source_archive.get("Hash"):
+                    overview += f"Archive Hash: {source_archive.get('Hash')}\n"
+                if source_state.get("$type"):
+                    overview += f"Archive State Type: {source_state.get('$type')}\n"
                 if source_state.get("Version"):
                     overview += f"Source Version: {source_state.get('Version')}\n"
                 if links["page"]:
@@ -1918,6 +3069,7 @@ class WabbajackGuideApp:
                 "size": size,
                 "target_path": target_path,
                 "archive_path": archive_path,
+                "source_mod": file_info.get("source_mod", "Unknown"),
             }
 
         return tree
@@ -1946,16 +3098,18 @@ class WabbajackGuideApp:
 
         file_list = row.get("folder_files", [])
         source_names = {
-            source_archive.get("Hash", ""): (
-                source_archive.get("State", {}).get("Name")
-                or source_archive.get("Name", "Unknown")
-            )
+            source_archive.get("Hash", ""): self.get_source_archive_label(source_archive)
             for source_archive in row.get("source_archives", [])
         }
 
         search_text = self.files_search_var.get().lower().strip() if hasattr(self, "files_search_var") else ""
         filtered_files = []
+        hide_mohidden = bool(
+            hasattr(self, "files_hide_mohidden_var") and self.files_hide_mohidden_var.get()
+        )
         for file_info in file_list:
+            if hide_mohidden and self.is_mohidden_file(file_info):
+                continue
             enriched = dict(file_info)
             enriched["source_mod"] = source_names.get(file_info.get("archive_hash", ""), "Unknown")
             if search_text:
@@ -1969,6 +3123,8 @@ class WabbajackGuideApp:
                 if search_text not in haystack:
                     continue
             filtered_files.append(enriched)
+
+        filtered_files = self.sort_files_for_column(filtered_files)
 
         if filtered_files:
             file_tree = self.organize_files_by_directory(filtered_files, row.get("raw_name"))
@@ -1996,7 +3152,7 @@ class WabbajackGuideApp:
             self.sources_tree.insert("", "end", text="No sources for separators.")
             return
 
-        source_archives = row.get("source_archives", [])
+        source_archives = list(row.get("source_archives", []))
         if not source_archives:
             self.sources_tree.insert("", "end", text="No source archives available.")
             return
@@ -2005,16 +3161,32 @@ class WabbajackGuideApp:
         folder_prefix = f"mods\\{folder_name}\\"
         search_text = self.sources_search_var.get().lower().strip() if hasattr(self, "sources_search_var") else ""
         files_by_archive = {}
+        hide_mohidden = bool(
+            hasattr(self, "sources_hide_mohidden_var") and self.sources_hide_mohidden_var.get()
+        )
         for file_info in row.get("folder_files", []):
+            if hide_mohidden and self.is_mohidden_file(file_info):
+                continue
             archive_hash = file_info.get("archive_hash", "")
             files_by_archive.setdefault(archive_hash, []).append(file_info)
 
-        for index, source_archive in enumerate(source_archives, start=1):
-            source_state = source_archive.get("State", {})
-            links = self.build_archive_links(source_archive)
-            source_name = source_state.get("Name") or source_archive.get("Name", "Unknown")
+        source_groups = []
+        for source_archive in source_archives:
             archive_hash = source_archive.get("Hash", "")
             source_files = files_by_archive.get(archive_hash, [])
+            source_groups.append((source_archive, source_files))
+
+        source_groups.sort(
+            key=lambda item: self.get_source_sort_value(item[0], item[1], self.sources_sort_column),
+            reverse=self.sources_sort_reverse,
+        )
+
+        for index, (source_archive, source_files) in enumerate(source_groups, start=1):
+            source_state = source_archive.get("State", {})
+            links = self.build_archive_links(source_archive)
+            source_name = self.get_source_archive_label(source_archive)
+            archive_hash = source_archive.get("Hash", "")
+            source_files = self.sort_files_for_column(list(source_files))
 
             if search_text:
                 matched_files = []

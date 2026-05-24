@@ -34,6 +34,7 @@ extract_wabbajack.py
 
 # temp files
 _temp_modlist.json
+wabbajack_viewer.config.json
 
 # generated exports
 exports/
