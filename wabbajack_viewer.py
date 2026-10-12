@@ -1151,7 +1151,7 @@ class WabbajackGuideApp:
             def on_include_toggled(*args):
                 deactivate_check.config(state=tk.NORMAL if include_var.get() else tk.DISABLED)
             
-            include_var.trace("w", on_include_toggled)
+            include_var.trace_add("write", on_include_toggled)
             
             button_frame = ttk.Frame(frame)
             button_frame.pack(fill=tk.X)
@@ -2314,7 +2314,7 @@ class WabbajackGuideApp:
         search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
         ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 6))
         self.search_var = tk.StringVar()
-        self.search_var.trace("w", self.filter_mods)
+        self.search_var.trace_add("write", self.filter_mods)
         search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=56)
         search_entry.pack(side=tk.LEFT)
 
@@ -2394,7 +2394,7 @@ class WabbajackGuideApp:
         sources_search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
         ttk.Label(sources_search_frame, text="Search Sources:").pack(side=tk.LEFT, padx=(0, 6))
         self.sources_search_var = tk.StringVar()
-        self.sources_search_var.trace("w", self.on_sources_search_changed)
+        self.sources_search_var.trace_add("write", self.on_sources_search_changed)
         ttk.Entry(sources_search_frame, textvariable=self.sources_search_var, width=48).pack(side=tk.LEFT)
         self.sources_hide_mohidden_var = tk.BooleanVar(value=False)
         self.sources_hide_mohidden_check = ttk.Checkbutton(
@@ -2439,7 +2439,7 @@ class WabbajackGuideApp:
         files_search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
         ttk.Label(files_search_frame, text="Search Files:").pack(side=tk.LEFT, padx=(0, 6))
         self.files_search_var = tk.StringVar()
-        self.files_search_var.trace("w", self.on_files_search_changed)
+        self.files_search_var.trace_add("write", self.on_files_search_changed)
         ttk.Entry(files_search_frame, textvariable=self.files_search_var, width=48).pack(side=tk.LEFT)
         self.files_hide_mohidden_var = tk.BooleanVar(value=False)
         self.files_hide_mohidden_check = ttk.Checkbutton(
