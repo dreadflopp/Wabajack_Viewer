@@ -1,7 +1,4 @@
-import configparser
-from bisect import bisect_left
-from collections import Counter
-from difflib import SequenceMatcher
+import argparse
 import gzip
 import json
 from pathlib import Path
@@ -9,9 +6,21 @@ import re
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from datetime import datetime
 import webbrowser
 import zipfile
+import queue
+import threading
+
+from package_model import PackageModel
+from profile_locations import default_downloads_folder
+from viewer_snapshots import write_snapshot
+from ui_components import ActivityBanner, COLORS, ReadOnlyText, configure_style, style_text
+from directive_details import archive_contributions, contribution_summary, describe_directive
+from preferred_sources import (presentation_row, signature, verify_preferred_sources,
+                               preferred_source_candidates, SourceVerificationCancelled)
+
+from profile_compare import (general_metadata, mod_entries, positive_id, safe_url, source_links, metadata)
+from wabbajack_format import directive_type, downloader_type, package_path
 
 
 class Tooltip:
@@ -70,7 +79,7 @@ class Tooltip:
 
 
 class WabbajackGuideApp:
-    SOURCE_DIRECTIVE_TYPES = {"FromArchive", "PatchedFromArchive"}
+    SOURCE_DIRECTIVE_TYPES = {"FromArchive", "PatchedFromArchive", "TransformedTexture"}
     INLINE_SOURCE_PREFIX = "INLINEFILE::"
 
     @staticmethod
@@ -81,9 +90,15 @@ class WabbajackGuideApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Wabbajack Manual Installation Guide")
+        self.root.title("Wabbajack Viewer")
         self.root.geometry("1300x850")
+        self.root.minsize(760, 680)
         self.root.resizable(True, True)
+        self.style = configure_style(root)
+        self.details_split = .7
+        self.details_hidden = False
+        self.last_package_title = ''
+        self._initial_load = False
 
         # Modlist metadata
         self.modlist_data = None
@@ -106,32 +121,48 @@ class WabbajackGuideApp:
         self.active_profile = None
         self.all_profile_paths = []
         self.profile_modlist_text = ""
-        self.profile_ini_files = {}
 
         # UI list state
         self.mod_rows = []
         self.row_by_item_id = {}
         self.row_by_source_item_id = {}
+        self.row_by_file_item_id = {}
         self.sort_column = "number"
         self.sort_reverse = False
         self.sources_sort_column = "source_path"
         self.sources_sort_reverse = False
         self.files_sort_column = "target_path"
         self.files_sort_reverse = False
-        self.sort_state_before_external_only = None
         self.current_selected_row = None
-        self.external_compare_path = None
-        self.external_only_compare_names = []
+        self.installed_report = None
+        self.column_widths = {}
         self._tooltips = []
 
         self.current_wabbajack_file = None
         self.loaded_from_saved_modlist = False
         self.last_saved_modlist_path = ""
+        self.restore_last_session = True
+        self.restored_from_snapshot = False
+        self._save_thread = None
+        self._save_pending = None
+        self._snapshot_requests = []
+        self._save_events = queue.Queue()
+        self._closing = False
+        self.downloads_folder = ''
+        self._preferred_cache = {}
+        self._preferred_pending = set()
+        self._preferred_events = queue.Queue()
+        self._preferred_tasks = queue.Queue()
+        self._preferred_generation = 0
+        self._preferred_stop = threading.Event()
+        self._preferred_batch_keys = set()
         self.config_path = Path(__file__).with_name("wabbajack_viewer.config.json")
 
         self.load_persisted_preferences()
+        self.restore_session_var = tk.BooleanVar(value=self.restore_last_session)
 
         self.setup_ui()
+        self.root.protocol('WM_DELETE_WINDOW', self.request_close)
         self.auto_load_last_saved_modlist()
 
     @staticmethod
@@ -148,6 +179,14 @@ class WabbajackGuideApp:
 
         try:
             payload = json.loads(self.config_path.read_text(encoding="utf-8"))
+            self.downloads_folder = str(payload.get('downloads_folder', ''))
+            self.last_package_title = str(payload.get('last_package_title', ''))
+            self.restore_last_session = bool(payload.get('restore_last_session', True))
+            split = payload.get('details_split', .7)
+            self.details_split = min(.75, max(.2, split)) if isinstance(split, (int, float)) else .7
+            self.details_hidden = bool(payload.get('details_hidden', False))
+            if isinstance(payload.get('column_widths'), dict):
+                self.column_widths = {key: value for key, value in payload['column_widths'].items() if isinstance(value, dict)}
             candidate = payload.get("last_saved_modlist_path", "")
             if self.is_saved_modlist_path(candidate):
                 self.last_saved_modlist_path = str(candidate)
@@ -156,7 +195,13 @@ class WabbajackGuideApp:
 
     def persist_preferences(self):
         """Save app preferences to disk."""
-        payload = {"last_saved_modlist_path": self.last_saved_modlist_path or ""}
+        payload = {"last_saved_modlist_path": self.last_saved_modlist_path or "", 'column_widths': self.column_widths,
+                   'downloads_folder': getattr(self, 'downloads_folder', ''),
+                   'details_split': self.details_split,
+                   'details_hidden': self.details_hidden,
+                   'last_package_title': (' '.join(str(self.modlist_data.get(key, '')) for key in ('Name', 'Version')).strip()
+                                          if getattr(self, 'modlist_data', None) else getattr(self, 'last_package_title', '')),
+                   'restore_last_session': self.restore_session_var.get() if hasattr(self, 'restore_session_var') else True}
         try:
             self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -168,7 +213,66 @@ class WabbajackGuideApp:
             self.last_saved_modlist_path = str(file_path)
             self.persist_preferences()
 
-    def load_saved_modlist_from_path(self, file_path):
+    @property
+    def session_snapshot_path(self):
+        return self.config_path.with_name('wabbajack_session.wvmodlist.json.gz')
+
+    def autosave_session(self, *, wait=False):
+        if not self.mod_rows:
+            return
+        payload = self.snapshot_payload()
+        if wait:
+            write_snapshot(self.session_snapshot_path, payload)
+            return
+        self._save_pending = (self.session_snapshot_path, payload)
+        if self._save_thread is None:
+            self.start_session_write()
+
+    def start_session_write(self):
+        if self._snapshot_requests:
+            path, payload = self._snapshot_requests.pop(0)
+            self._saving_manual_snapshot = True
+        else:
+            path, payload = self._save_pending
+            self._save_pending = None
+            self._saving_manual_snapshot = False
+        self._saving_path = path
+        if self._closing or self.activity.owner in (None, 'save'):
+            title = 'Saving session before closing' if self._closing else 'Saving snapshot' if self._saving_manual_snapshot else 'Saving session'
+            self.activity.start('save', title)
+            self.set_status('Saving the parsed mod list in the background…')
+        def worker():
+            try:
+                write_snapshot(path, payload)
+                self._save_events.put(None)
+            except Exception as error:
+                self._save_events.put(str(error))
+        self._save_thread = threading.Thread(target=worker, daemon=True)
+        self._save_thread.start()
+        self._save_poll_id = self.root.after(100, self.poll_session_write)
+
+    def poll_session_write(self):
+        self._save_poll_id = None
+        if self._save_events.empty():
+            self._save_poll_id = self.root.after(100, self.poll_session_write)
+            return
+        error = self._save_events.get_nowait()
+        self._save_thread = None
+        self.activity.finish('save')
+        if self._saving_manual_snapshot:
+            if error:
+                messagebox.showerror('Snapshot not saved', f'Failed to save snapshot: {error}', parent=self.root)
+            else:
+                self.remember_saved_modlist_path(self._saving_path)
+        if not getattr(self, 'loading_package', False) and self.activity.owner is None:
+            self.set_status(f'Could not save snapshot: {error}' if error else
+                            f'Snapshot saved: {Path(self._saving_path).name}' if self._saving_manual_snapshot else 'Last session saved')
+        if self._snapshot_requests or self._save_pending:
+            self.start_session_write()
+        elif self._closing:
+            self.root.destroy()
+
+    def load_saved_modlist_from_path(self, file_path, *, quiet=False, remember=True):
         """Load a previously saved modlist snapshot from an explicit path."""
         if not file_path:
             return False
@@ -177,12 +281,19 @@ class WabbajackGuideApp:
         if not path.exists():
             return False
 
+        previous = self.__dict__.copy()
         try:
-            self.set_status("Loading saved modlist...")
+            self.set_status("Restoring mod list snapshot...")
             with gzip.open(path, "rb") as handle:
                 payload = json.load(handle)
+            self._preferred_generation += 1
+            self._preferred_pending = set()
+            self._preferred_batch_keys = set()
 
             self.modlist_data = payload.get("modlist_data") or {}
+            self.loaded_snapshot_path = str(path)
+            self.restored_from_snapshot = True
+            self.__dict__.pop("package_model", None)
             self.archives = payload.get("archives") or []
             self.directives = []
             self.archive_lookup = {}
@@ -194,7 +305,7 @@ class WabbajackGuideApp:
             self.synthetic_archive_by_hash = {}
             self.inline_file_sources = {}
             self.inline_text_cache = {}
-            self.profile_ini_files = payload.get("profile_ini_files") or {}
+            self.profile_modlist_text = ""
             self.all_profile_paths = payload.get("all_profile_paths") or []
             self.active_profile = payload.get("active_profile")
             self.current_wabbajack_file = payload.get("source_wabbajack")
@@ -227,38 +338,234 @@ class WabbajackGuideApp:
                 hydrated_rows.append(hydrated)
 
             self.mod_rows = hydrated_rows
-            self.loaded_from_saved_modlist = True
-            self.update_ui_after_load(prepare_rows=False)
-            self.remember_saved_modlist_path(str(path))
-            self.set_status(f"Loaded saved modlist: {path.name}")
+            self._preferred_cache = {}
+            for row, serialized in zip(hydrated_rows, rows):
+                saved = serialized.get('verified_sources')
+                if not saved:
+                    continue
+                alternatives = {}
+                for target, alternate in saved.get('alternatives', {}).items():
+                    archive = self.archive_by_hash.get(alternate['archive_hash'])
+                    if archive:
+                        alternatives[target] = {'archive': archive, 'member': alternate['member']}
+                self._preferred_cache[self.preferred_key(row)] = dict(saved, alternatives=alternatives,
+                    signature=tuple(saved['signature']) if saved.get('signature') is not None else None,
+                    _files=row['folder_files'])
+            self.snapshot_model_cache = payload.get('model_cache')
+            self.snapshot_restore_reason = ('The original package is missing or has changed.' if self.snapshot_model_cache
+                                            else 'This older snapshot contains browsing data only.')
+            if self.snapshot_model_cache and self.current_wabbajack_file:
+                try:
+                    self.package_model = PackageModel(self.current_wabbajack_file, self.set_status,
+                        cached=dict(self.snapshot_model_cache, manifest=self.modlist_data))
+                except (OSError, ValueError, KeyError):
+                    self.__dict__.pop('package_model', None)
+            self.loaded_from_saved_modlist = not hasattr(self, 'package_model')
+            if hasattr(self, 'package_model'):
+                self.inline_file_sources = {key.replace('/', '\\'): source for key, source in self.package_model.inline_sources.items()}
+                self.inline_text_cache = {key.replace('/', '\\'): text for key, text in self.package_model.text_cache.items()}
+                self.directives = self.modlist_data['Directives']
+                self.mod_folder_files = {}
+                self.process_directives()
+                for row in hydrated_rows:
+                    self.mod_folder_files[row.get('folder_key') or row['raw_name'].casefold()] = row['folder_files']
+                self.mod_folder_meta_cache = {row.get('folder_key') or row['raw_name'].casefold(): row.get('folder_meta', {}) for row in hydrated_rows}
+                self.mod_folder_meta_paths = self.build_mod_folder_meta_paths()
+                self.profile_modlist_text = payload.get('profile_modlist_text', '')
+            self.update_ui_after_load(prepare_rows=False, verify_sources=payload.get('snapshot_version', 1) < 2)
+            self.restore_snapshot_ui(payload.get('ui_state', {}))
+            if remember:
+                self.remember_saved_modlist_path(str(path))
+                self.autosave_session()
+            self.set_status(f"Restored snapshot: {path.name}" + (' · browsing only' if self.loaded_from_saved_modlist else ''))
             return True
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load saved modlist: {e}")
+            self.__dict__.update(previous)
+            self.load_error = str(e)
+            self.update_ui_after_load(prepare_rows=False, verify_sources=False)
+            if quiet:
+                self.set_status(f'Could not restore the last session: {e}')
+            else:
+                messagebox.showerror("Error", f"Failed to open snapshot: {e}")
             return False
 
     def auto_load_last_saved_modlist(self):
         """Load the last saved snapshot automatically when available."""
-        if not self.last_saved_modlist_path:
+        if not self.restore_session_var.get():
             return
-        if not self.is_saved_modlist_path(self.last_saved_modlist_path):
-            return
-        self.load_saved_modlist_from_path(self.last_saved_modlist_path)
+        paths = [self.session_snapshot_path] if self.session_snapshot_path.exists() else []
+        if self.is_saved_modlist_path(self.last_saved_modlist_path) and Path(self.last_saved_modlist_path).exists():
+            paths.append(Path(self.last_saved_modlist_path))
+        if paths:
+            self.start_snapshot_load(paths[0], fallback=paths[1:], automatic=True)
 
     def load_wabbajack_file(self):
         """Open file dialog to select and load Wabbajack file."""
+        if self._closing or getattr(self, 'loading_package', False):
+            return
+        if getattr(self, 'workbench_view', None) and self.workbench_view.busy:
+            return
         file_path = filedialog.askopenfilename(
             title="Select Wabbajack File",
+            initialdir=default_downloads_folder(),
             filetypes=[("Wabbajack files", "*.wabbajack"), ("All files", "*.*")],
         )
 
         if file_path:
-            self.current_wabbajack_file = file_path
-            self.extract_and_load_modlist(file_path)
+            self.start_package_load(file_path)
+
+    def start_package_load(self, path):
+        self.start_document_load(path)
+
+    def start_snapshot_load(self, path, *, fallback=(), automatic=False):
+        self.start_document_load(path, snapshot=True, fallback=fallback, automatic=automatic)
+
+    def start_document_load(self, path, *, snapshot=False, fallback=(), automatic=False, profile=None):
+        if self._closing or getattr(self, 'loading_package', False):
+            return
+        if self.workbench_view and self.workbench_view.busy:
+            return
+        self.loading_package = True
+        initial_load = not self.modlist_data
+        self._initial_load = initial_load
+        if initial_load:
+            self.header_frame.grid_remove()
+            self.workspace.grid_remove()
+            self.status_frame.grid_remove()
+        self._preferred_generation += 1
+        self._preferred_pending.clear()
+        self.comparison_view.set_blocked(True)
+        self.load_cancel = threading.Event()
+        events = queue.Queue()
+        restore_title = f'Restoring {self.last_package_title}…' if self.last_package_title else 'Restoring last session…'
+        self.activity.start('load', f'Switching to profile: {profile}' if profile else restore_title if automatic else 'Opening snapshot' if snapshot else 'Opening Wabbajack', self.load_cancel.set)
+        self.set_status('Restoring cached mod list…' if snapshot else 'Reading and verifying package files…')
+        previous_states = []
+        menu_states = []
+        for menu in (self.saved_views_menu, self.export_menu):
+            for index in range(menu.index('end') + 1):
+                menu_states.append((menu, index, menu.entrycget(index, 'state')))
+                menu.entryconfigure(index, state=tk.DISABLED)
+        for widget in [widget for widget, _ in self.header_toolbar_widgets] + [self.source_downloads_button]:
+            if isinstance(widget, ttk.Label):
+                continue
+            try:
+                previous_states.append((widget, widget.cget('state')))
+                widget.configure(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+        self.cancel_load_button.config(state=tk.NORMAL)
+        self.layout_header_buttons()
+        stage = WabbajackGuideApp.__new__(WabbajackGuideApp)
+        stage.__dict__ = self.__dict__.copy()
+        stage._preferred_cache = dict(self._preferred_cache) if profile else {}
+        stage.mod_folder_meta_cache = dict(self.mod_folder_meta_cache)
+        stage.inline_text_cache = dict(self.inline_text_cache)
+        stage.synthetic_archive_by_hash = dict(self.synthetic_archive_by_hash)
+        stage.update_ui_after_load = lambda **kwargs: None
+        stage.restore_snapshot_ui = lambda state: setattr(stage, '_restored_ui_state', state)
+        def progress(message):
+            if self.load_cancel.is_set():
+                raise SourceVerificationCancelled('Opening cancelled.')
+            if events.qsize() < 4:
+                events.put(('progress', message))
+        stage.set_status = progress
+        def worker():
+            if profile:
+                stage.load_profile_inline_data(preferred_profile=profile)
+                success = True
+            elif snapshot:
+                success = False
+                for candidate in (path, *fallback):
+                    if stage.load_saved_modlist_from_path(candidate, quiet=True, remember=False):
+                        success = True
+                        break
+            else:
+                success = stage.extract_and_load_modlist(path, notify=False)
+            if success and not snapshot:
+                for key, item in stage.package_model.destinations.items():
+                    if key.startswith('mods/') and key.endswith('/meta.ini') and key in stage.package_model.inline_sources:
+                        progress('Reading mod metadata…')
+                        stage.mod_folder_meta_cache[key.split('/')[1]] = stage.parse_meta_ini(stage.package_model.read_text(item))
+                stage.prepare_mod_rows(render=False)
+                stage.verify_sources_before_display()
+            events.put(('done', success))
+        def guarded_worker():
+            try:
+                worker()
+            except Exception as error:
+                stage.load_error = str(error)
+                events.put(('done', False))
+        threading.Thread(target=guarded_worker, daemon=True).start()
+        def poll():
+            self._load_poll_id = None
+            done = False
+            while not events.empty():
+                kind, value = events.get_nowait()
+                if kind == 'progress':
+                    self.set_status(value)
+                else:
+                    done = True
+                    self.loading_package = False
+                    self.comparison_view.set_blocked(False)
+                    for widget, state in previous_states:
+                        widget.configure(state=state)
+                    for menu, index, state in menu_states:
+                        menu.entryconfigure(index, state=state)
+                    self.cancel_load_button.config(state=tk.DISABLED)
+                    self.activity.finish('load')
+                    self._initial_load = False
+                    if initial_load:
+                        self.header_frame.grid()
+                        self.workspace.grid()
+                        self.status_frame.grid()
+                    self.layout_header_buttons()
+                    if value and not self.load_cancel.is_set():
+                        fields = ('modlist_data archives directives archive_lookup archive_by_hash archive_name_index mod_folder_index archive_normalized_index mod_folder_meta_cache mod_folder_meta_paths mod_folder_files mod_folder_archive_hashes synthetic_archive_by_hash inline_file_sources inline_text_cache active_profile all_profile_paths profile_modlist_text current_wabbajack_file loaded_from_saved_modlist package_model mod_rows _preferred_cache _preferred_batch_keys restored_from_snapshot loaded_snapshot_path snapshot_model_cache snapshot_restore_reason').split()
+                        for field in fields:
+                            if hasattr(stage, field):
+                                setattr(self, field, getattr(stage, field))
+                            else:
+                                self.__dict__.pop(field, None)
+                        self.update_ui_after_load(prepare_rows=False, verify_sources=False)
+                        if snapshot:
+                            self.restore_snapshot_ui(getattr(stage, '_restored_ui_state', {}))
+                            self.set_status('Last session restored' if automatic else 'Snapshot opened')
+                            if not automatic:
+                                self.remember_saved_modlist_path(str(path))
+                        if not automatic:
+                            self.autosave_session()
+                    else:
+                        self.refresh_profile_selector()
+                        self.set_status(getattr(stage, 'load_error', 'Opening cancelled.'))
+            if not done:
+                self._load_poll_id = self.root.after(100, poll)
+        self._load_poll_id = self.root.after(100, poll)
+
+    def on_root_destroy(self, event):
+        if event.widget is not self.root:
+            return
+        if hasattr(self, 'load_cancel'):
+            self.load_cancel.set()
+        self._preferred_stop.set()
+        self.activity.finish()
+        if self.comparison_view:
+            self.comparison_view.cancelled.set()
+        timers = [getattr(self, '_load_poll_id', None),
+                  getattr(self, '_preferred_poll_id', None),
+                  getattr(self, '_save_poll_id', None),
+                  getattr(self.comparison_view, 'poll_id', None),
+                  getattr(getattr(self, 'workbench_view', None), 'poll_id', None)]
+        for timer in timers:
+            if timer:
+                self.root.tk.call('after', 'cancel', timer)
 
     def set_status(self, message):
         """Update status text and flush pending UI updates."""
         if hasattr(self, "status_var"):
             self.status_var.set(message)
+            if hasattr(self, 'activity') and self.activity.owner:
+                self.activity.phase.set(message)
             self.root.update_idletasks()
 
     @staticmethod
@@ -288,6 +595,9 @@ class WabbajackGuideApp:
     def build_grouped_install_data(self, row):
         """Group install operations by source type for efficient extraction."""
         folder_name = str(row.get("raw_name", ""))
+        if "/" in folder_name or "\\" in folder_name or folder_name in ("", ".", ".."):
+            raise ValueError("Invalid mod folder name for installer export.")
+        package_path(f"mods/{folder_name}/placeholder")
         folder_prefix = f"mods\\{folder_name}\\"
         archive_names = {
             archive.get("Hash", ""): archive.get("Name", "")
@@ -298,9 +608,22 @@ class WabbajackGuideApp:
         archive_groups = {}
         embedded_files = []
         for file_info in row.get("folder_files", []):
+            directive_type = file_info.get("directive_type", "")
+            if directive_type not in {"FromArchive", "InlineFile"}:
+                raise ValueError(
+                    f"Cannot replay {directive_type or 'unknown'} directives in a simple extraction script. "
+                    "Use Wabbajack for mods requiring patches, generated archives or path substitutions."
+                )
+            if file_info.get("archive_depth", 2) > 2:
+                raise ValueError("Nested archive extraction requires Wabbajack; this mod cannot be exported as a simple installer.")
+            if directive_type == "FromArchive" and "archive_depth" not in file_info:
+                raise ValueError("This older snapshot lacks archive nesting information. Reload the original .wabbajack before exporting installers.")
             archive_hash = file_info.get("archive_hash", "")
             target_path = str(file_info.get("target_path", ""))
+            package_path(target_path)
             target_relative = target_path[len(folder_prefix):] if target_path.lower().startswith(folder_prefix.lower()) else target_path
+            if not target_path.lower().startswith(folder_prefix.lower()):
+                raise ValueError("Installer target is outside the selected mod folder.")
 
             if str(archive_hash).startswith(self.INLINE_SOURCE_PREFIX):
                 source_data_id = str(file_info.get("source_data_id", "")).strip()
@@ -309,6 +632,8 @@ class WabbajackGuideApp:
                     if archive_path.startswith("[Embedded InlineFile] "):
                         source_data_id = archive_path[len("[Embedded InlineFile] "):].strip()
                 if source_data_id:
+                    if not re.fullmatch(r"[A-Za-z0-9._-]+", source_data_id) or source_data_id in (".", ".."):
+                        raise ValueError("Invalid embedded payload name for installer export.")
                     embedded_files.append(
                         {
                             "source_data_id": source_data_id,
@@ -319,7 +644,10 @@ class WabbajackGuideApp:
 
             archive_filename = archive_names.get(archive_hash, "")
             if not archive_filename:
-                continue
+                raise ValueError("Source archive metadata is missing; refusing an incomplete installer.")
+
+            package_path(file_info.get("archive_path", ""))
+            package_path(archive_filename)
 
             group = archive_groups.setdefault(archive_filename, [])
             group.append(
@@ -338,6 +666,11 @@ class WabbajackGuideApp:
         archive_groups = grouped.get("archive_groups", {})
         embedded_files = grouped.get("embedded_files", [])
         wabbajack_name = Path(self.current_wabbajack_file).name if self.current_wabbajack_file else ""
+        values = [folder_name, wabbajack_name] + list(archive_groups)
+        values += [value for items in archive_groups.values() for item in items for value in item.values()]
+        values += [value for item in embedded_files for value in item.values()]
+        if any(any(character in value for character in '!"%\r\n&|<>^') for value in values):
+            raise ValueError("These paths contain characters unsupported by the batch exporter. Use Wabbajack instead.")
         lines = [
             "@echo off",
             "setlocal EnableDelayedExpansion",
@@ -367,6 +700,7 @@ class WabbajackGuideApp:
             'mkdir "%TEMP_ROOT%" >nul 2>nul',
             'mkdir "%OUTPUT_DIR%" >nul 2>nul',
             'break > "%LOG_PATH%"',
+            'goto :install_start',
             '',
             ':resolve_archive',
             'set "FOUND_ARCHIVE_PATH="',
@@ -375,6 +709,7 @@ class WabbajackGuideApp:
             ')',
             'exit /b',
             '',
+            ':install_start',
         ]
 
         for index, (archive_filename, items) in enumerate(archive_groups.items(), start=1):
@@ -481,16 +816,23 @@ class WabbajackGuideApp:
         grouped = self.build_grouped_install_data(row)
         archive_groups = grouped.get("archive_groups", {})
         embedded_files = grouped.get("embedded_files", [])
+        for items in archive_groups.values():
+            for item in items:
+                item["archive_path"] = item["archive_path"].replace("\\", "/")
+                item["target_relative"] = item["target_relative"].replace("\\", "/")
+        for item in embedded_files:
+            item["target_relative"] = item["target_relative"].replace("\\", "/")
         wabbajack_name = Path(self.current_wabbajack_file).name if self.current_wabbajack_file else ""
         lines = [
             '#!/usr/bin/env bash',
             'set +e',
             '',
             'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"',
-            f'OUTPUT_DIR="$SCRIPT_DIR/{folder_name}"',
-            'TEMP_ROOT="$SCRIPT_DIR/.extract_temp"',
+            f'OUTPUT_DIR="$SCRIPT_DIR"/{self.quote_bash(folder_name)}',
+            'TEMP_ROOT="$(mktemp -d "$SCRIPT_DIR/.extract_temp.XXXXXX")" || exit 1',
+            'trap \'rm -rf -- "$TEMP_ROOT"\' EXIT',
             'LOG_PATH="$SCRIPT_DIR/install_errors.log"',
-            f'WABBAJACK_PATH="$SCRIPT_DIR/{wabbajack_name}"' if wabbajack_name else 'WABBAJACK_PATH=""',
+            f'WABBAJACK_PATH="$SCRIPT_DIR"/{self.quote_bash(wabbajack_name)}' if wabbajack_name else 'WABBAJACK_PATH=""',
             'SEARCH_DIRS=("$SCRIPT_DIR")',
             'for arg in "$@"; do',
             '  if [[ "$arg" == --wabbajack=* ]]; then',
@@ -505,7 +847,6 @@ class WabbajackGuideApp:
             '  exit 1',
             'fi',
             '',
-            'rm -rf "$TEMP_ROOT"',
             'mkdir -p "$TEMP_ROOT" "$OUTPUT_DIR"',
             ': > "$LOG_PATH"',
             '',
@@ -627,19 +968,6 @@ class WabbajackGuideApp:
         self.root.clipboard_append(name)
         self.set_status(f"Copied mod name: {name}")
 
-    def open_selected_mod_page(self):
-        """Open the selected mod's page URL in the default browser."""
-        row = self.current_selected_row
-        url = self.get_mod_page_url(row)
-        if not url:
-            messagebox.showwarning("No URL", "No mod page URL is available for the selected mod.")
-            return
-
-        try:
-            webbrowser.open(url)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open mod URL: {e}")
-
     def add_tooltip(self, widget, text):
         """Attach a tooltip to a widget and keep it alive."""
         if not text:
@@ -657,13 +985,15 @@ class WabbajackGuideApp:
         """Refresh visible sort labels for the mod list and detail trees."""
         if hasattr(self, "tree"):
             mod_headings = {
-                "#0": "#",
-                "active": "Active",
-                "name": "Mod Name",
-                "sources": "Sources",
+                "#0": "WJ #" if self.installed_report else '#',
+                "active": "WJ active" if self.installed_report else 'Active',
+                "name": "Wabbajack mod" if self.installed_report else 'Mod name',
+                "sources": "Archives",
                 "author": "Author",
-                "version": "Version",
-                "size": "Size (MB)",
+                "version": "WJ version" if self.installed_report else 'Version',
+                "size": "Downloads (MiB)",
+                'result': 'Result', 'local_name': 'Installed mod', 'local_version': 'Installed version',
+                'local_order': 'Installed #', 'local_active': 'Installed active',
             }
             for column, label in mod_headings.items():
                 is_active = (column == "#0" and self.sort_column == "number") or (column != "#0" and self.sort_column == column)
@@ -672,11 +1002,12 @@ class WabbajackGuideApp:
 
         if hasattr(self, "sources_tree"):
             source_headings = {
-                "#0": ("Source Archive", "source"),
-                "target_path": ("Install Path", "target_path"),
-                "source_path": ("Source Path", "source_path"),
+                "#0": ("Source (recorded title)", "source"),
+                "archive_filename": ("Archive filename", "archive_filename"),
+                "target_path": ("Install path", "target_path"),
+                "source_path": ("Source path", "source_path"),
                 "size": ("Size (bytes)", "size"),
-                "kind": ("Directive", "kind"),
+                "kind": ("Directive type", "kind"),
             }
             for column, (label, sort_key) in source_headings.items():
                 is_active = self.sources_sort_column == sort_key
@@ -685,9 +1016,9 @@ class WabbajackGuideApp:
 
         if hasattr(self, "files_tree"):
             file_headings = {
-                "#0": ("Target Path", "target_path"),
-                "source_mod": ("Source Mod", "source_mod"),
-                "source_path": ("Source Path", "source_path"),
+                "#0": ("Output path", "target_path"),
+                "source_mod": ("Source archive", "source_mod"),
+                "source_path": ("Source path", "source_path"),
                 "size": ("Size (bytes)", "size"),
             }
             for column, (label, sort_key) in file_headings.items():
@@ -702,6 +1033,10 @@ class WabbajackGuideApp:
 
         urls = []
         seen = set()
+        for url in (row.get('comparison') or {}).get('links', []):
+            if url not in seen:
+                seen.add(url)
+                urls.append(({'Name': 'Source page'}, url))
         for source_archive in row.get("source_archives", []):
             page = self.build_archive_links(source_archive).get("page")
             if page and page not in seen:
@@ -709,11 +1044,6 @@ class WabbajackGuideApp:
                 urls.append((source_archive, page))
 
         return urls
-
-    def get_mod_page_url(self, row):
-        """Return the first mod-page URL source used by the details panel."""
-        urls = self.get_mod_page_urls(row)
-        return urls[0][1] if urls else ""
 
     def get_source_archive_label(self, source_archive):
         """Return a user-facing label for a source archive or embedded source."""
@@ -727,6 +1057,8 @@ class WabbajackGuideApp:
         state = source_archive.get("State", {}) if source_archive else {}
         if column == "source":
             return self.get_source_archive_label(source_archive).lower()
+        if column == 'archive_filename':
+            return str(source_archive.get('Name', '')).casefold()
         if column == "target_path":
             return min((str(item.get("target_path", "")).lower() for item in source_files), default="")
         if column == "source_path":
@@ -808,8 +1140,8 @@ class WabbajackGuideApp:
 
         try:
             script_text = self.build_batch_install_script(row) if script_type == "bat" else self.build_bash_install_script(row)
-            newline = "\r\n" if script_type == "bat" else "\n"
-            Path(output_path).write_text(script_text, encoding="utf-8", newline=newline)
+            with Path(output_path).open("w", encoding="utf-8", newline="") as output:
+                output.write(script_text)
             self.set_status(f"Exported {script_type} install script for {row.get('raw_name', row.get('name', 'mod'))}")
             messagebox.showinfo(
                 "Install Script Exported",
@@ -860,46 +1192,29 @@ class WabbajackGuideApp:
                     url_menu.add_command(label=label, command=lambda value=url: webbrowser.open(value))
                 menu.add_cascade(label="Mod URLs", menu=url_menu)
             if row.get("folder_files"):
-                menu.add_command(
-                    label="Export BAT Install Script",
-                    command=lambda: self.export_install_script_for_selected("bat"),
-                )
-                menu.add_command(
-                    label="Export Bash Install Script",
-                    command=lambda: self.export_install_script_for_selected("sh"),
-                )
+                try:
+                    self.build_grouped_install_data(row)
+                except ValueError:
+                    menu.add_command(label='Extraction scripts unavailable (requires Wabbajack)', state=tk.DISABLED)
+                else:
+                    scripts = tk.Menu(menu, tearoff=False)
+                    scripts.add_command(label='Windows batch…', command=lambda: self.export_install_script_for_selected('bat'))
+                    scripts.add_command(label='Bash…', command=lambda: self.export_install_script_for_selected('sh'))
+                    menu.add_cascade(label='Export extraction script', menu=scripts)
 
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
-    def build_modlist_txt(self, include_external_only=False, deactivate_external_only=False, reverse_for_mo2=True):
-        """Return modlist.txt content in MO2 load-order format.
-        
-        Builds visible order first (including external-only entries at their positions),
-        then reverses to match modlist.txt format.
-        """
-        # Build visible order. For standard export, honor current sort.
-        # For merged export, use compare placement order for external-only entries.
-        visible_order = []
-        if include_external_only:
-            export_rows = self.get_rows_in_compare_placement_order(include_external_only=True)
-        else:
-            export_rows = self.get_rows_in_current_sort_order()
-
-        for row in export_rows:
-            is_external_only = bool(row.get("external_only"))
-            if is_external_only:
-                prefix = "-" if deactivate_external_only else "+"
-            else:
-                prefix = self.get_activation_prefix_from_state(row.get("activation_state") or ("active" if row.get("active") else "inactive"))
+    def build_modlist_txt(self):
+        """Export authored MO2 order, unaffected by browsing sort or search."""
+        lines = []
+        # MO2 stores mod order in reverse of display order.
+        for row in reversed(self.mod_rows):
+            prefix = self.get_activation_prefix_from_state(row.get("activation_state") or ("active" if row.get("active") else "inactive"))
             raw_name = row.get("raw_name") or row.get("name") or "mod"
-            visible_order.append((prefix, raw_name, is_external_only))
-
-        # MO2 modlist.txt uses reverse of display order. For diagnostics, caller can disable reversal.
-        ordered_rows = reversed(visible_order) if reverse_for_mo2 else visible_order
-        lines = [f"{prefix}{name}" for prefix, name, _ in ordered_rows]
+            lines.append(f"{prefix}{raw_name}")
         return "\r\n".join(lines) + ("\r\n" if lines else "")
 
     @staticmethod
@@ -927,144 +1242,21 @@ class WabbajackGuideApp:
 
     @staticmethod
     def get_activation_mark_for_row(row):
-        """Return a compact table mark for the row activation state."""
+        """Use the same Yes/No convention on both sides of the comparison."""
         if row.get("is_separator"):
             return ""
         state = row.get("activation_state") or ("active" if row.get("active") else "inactive")
-        if state == "always":
-            return "[*]"
-        if state == "inactive":
-            return "[ ]"
-        return "[x]"
+        return 'No' if state == 'inactive' else 'Yes'
 
     @staticmethod
     def get_activation_label_for_row(row):
         """Return a human-readable activation label for the row."""
         state = row.get("activation_state") or ("active" if row.get("active") else "inactive")
         if state == "always":
-            return "Always Active"
+            return "Always active"
         if state == "inactive":
-            return "Inactive"
-        return "Active"
-
-    def get_rows_in_compare_placement_order(self, include_external_only=False):
-        """Return rows in compare placement order, optionally including external-only entries."""
-        if not include_external_only or not self.external_only_compare_names:
-            return list(self.mod_rows)
-
-        inserts_by_index = {}
-        for entry in self.external_only_compare_names:
-            insert_index = int(entry.get("insert_index", len(self.mod_rows)))
-            inserts_by_index.setdefault(insert_index, []).append(entry)
-
-        interleaved_rows = []
-        wb_index = 0
-        external_counter = 0
-
-        for row in self.mod_rows:
-            if not row.get("is_separator"):
-                for entry in inserts_by_index.get(wb_index, []):
-                    external_counter += 1
-                    raw_name = str(entry.get("name", ""))
-                    display_name, is_separator = self.parse_external_entry_name(raw_name)
-                    interleaved_rows.append(
-                        {
-                            "number": f"E{external_counter}",
-                            "name": display_name,
-                            "raw_name": raw_name,
-                            "folder_key": self.normalize_mod_key(raw_name),
-                            "active": False,
-                            "activation_state": "inactive",
-                            "is_separator": is_separator,
-                            "author": "-",
-                            "version": "",
-                            "size_mb": "",
-                            "direct_link_count": 0,
-                            "archive_hash": "",
-                            "archive_name": "",
-                            "archive": None,
-                            "folder_meta": {},
-                            "source_archives": [],
-                            "folder_files": [],
-                            "source_file_counts": {},
-                            "compare_status": "external_only",
-                            "external_only": True,
-                        }
-                    )
-                wb_index += 1
-
-            interleaved_rows.append(row)
-
-        for entry in inserts_by_index.get(wb_index, []):
-            external_counter += 1
-            raw_name = str(entry.get("name", ""))
-            display_name, is_separator = self.parse_external_entry_name(raw_name)
-            interleaved_rows.append(
-                {
-                    "number": f"E{external_counter}",
-                    "name": display_name,
-                    "raw_name": raw_name,
-                    "folder_key": self.normalize_mod_key(raw_name),
-                    "active": False,
-                    "activation_state": "inactive",
-                    "is_separator": is_separator,
-                    "author": "-",
-                    "version": "",
-                    "size_mb": "",
-                    "direct_link_count": 0,
-                    "archive_hash": "",
-                    "archive_name": "",
-                    "archive": None,
-                    "folder_meta": {},
-                    "source_archives": [],
-                    "folder_files": [],
-                    "source_file_counts": {},
-                    "compare_status": "external_only",
-                    "external_only": True,
-                }
-            )
-
-        return interleaved_rows
-
-    def get_rows_in_current_sort_order(self):
-        """Return base mod rows ordered exactly like the current sort settings."""
-        rows = list(self.mod_rows)
-
-        def sort_key(item):
-            if self.sort_column == "number":
-                number = item.get("number", 0)
-                if isinstance(number, str) and number.startswith("E"):
-                    try:
-                        return (1, int(number[1:]))
-                    except Exception:
-                        return (1, 0)
-                try:
-                    return (0, int(number))
-                except Exception:
-                    return (0, 0)
-            if self.sort_column == "active":
-                state = item.get("activation_state") or ("active" if item.get("active") else "inactive")
-                if state == "always":
-                    return 2
-                if state == "active":
-                    return 1
-                return 0
-            if self.sort_column == "name":
-                return str(item.get("name", "")).lower()
-            if self.sort_column == "sources":
-                return len(item.get("source_archives", []))
-            if self.sort_column == "author":
-                return str(item.get("author", "")).lower()
-            if self.sort_column == "version":
-                return str(item.get("version", "")).lower()
-            if self.sort_column == "size":
-                try:
-                    return float(item.get("size_mb") or 0)
-                except Exception:
-                    return 0.0
-            return item.get("number", 0)
-
-        return sorted(rows, key=sort_key, reverse=self.sort_reverse)
+            return "No"
+        return "Yes"
 
     def copy_tree_selection(self, event=None):
         """Copy selected rows from the mod table as tab-separated text."""
@@ -1079,6 +1271,12 @@ class WabbajackGuideApp:
         for item_id in selection:
             row = self.row_by_item_id.get(item_id)
             if not row:
+                continue
+            if self.installed_report:
+                columns = self.tree['columns']
+                values = self.tree.item(item_id, 'values')
+                lines.append('\t'.join([self.tree.item(item_id, 'text'),
+                    *(str(values[columns.index(column)]) for column in self.tree['displaycolumns'])]))
                 continue
 
             number = str(row.get("number", ""))
@@ -1099,130 +1297,40 @@ class WabbajackGuideApp:
         return "break"
 
     def export_modlist_txt(self):
-        """Export the current MO2 modlist.txt load-order file."""
+        """Export the authored MO2 modlist.txt load-order file."""
         if not self.mod_rows:
             messagebox.showwarning("No Data", "Load a Wabbajack file first.")
             return
-
-        include_external_only = False
-        deactivate_external_only = False
-        has_external_only = bool(self.external_only_compare_names)
-        
-        if has_external_only:
-            dialog = tk.Toplevel(self.root)
-            dialog.title("Export modlist.txt Options")
-            dialog.geometry("450x220")
-            dialog.resizable(False, False)
-            dialog.transient(self.root)
-            dialog.grab_set()
-            
-            frame = ttk.Frame(dialog, padding="20")
-            frame.pack(fill=tk.BOTH, expand=True)
-            
-            ttk.Label(
-                frame,
-                text="A compare modlist is loaded with external-only entries.",
-                font=("TkDefaultFont", 10)
-            ).pack(anchor=tk.W, pady=(0, 10))
-            
-            ttk.Label(
-                frame,
-                text=f"External-only entries found: {len(self.external_only_compare_names)}",
-                font=("TkDefaultFont", 9, "italic")
-            ).pack(anchor=tk.W, pady=(0, 15))
-            
-            include_var = tk.BooleanVar(value=False)
-            include_check = ttk.Checkbutton(
-                frame,
-                text="Include external-only mods in export (merged modlist)",
-                variable=include_var
-            )
-            include_check.pack(anchor=tk.W, pady=(0, 10))
-            
-            deactivate_var = tk.BooleanVar(value=False)
-            deactivate_check = ttk.Checkbutton(
-                frame,
-                text="Deactivate all external-only mods (prefix with -)",
-                variable=deactivate_var,
-                state=tk.DISABLED
-            )
-            deactivate_check.pack(anchor=tk.W, pady=(0, 20))
-            
-            def on_include_toggled(*args):
-                deactivate_check.config(state=tk.NORMAL if include_var.get() else tk.DISABLED)
-            
-            include_var.trace_add("write", on_include_toggled)
-            
-            button_frame = ttk.Frame(frame)
-            button_frame.pack(fill=tk.X)
-            
-            def on_ok():
-                nonlocal include_external_only, deactivate_external_only
-                include_external_only = include_var.get()
-                deactivate_external_only = deactivate_var.get() and include_external_only
-                dialog.destroy()
-            
-            export_button = ttk.Button(button_frame, text="Export", command=on_ok)
-            export_button.pack(side=tk.RIGHT, padx=(5, 0))
-            cancel_button = ttk.Button(button_frame, text="Cancel", command=dialog.destroy)
-            cancel_button.pack(side=tk.RIGHT)
-
-            self.add_tooltip(include_check, "Include entries that exist only in the comparison modlist.")
-            self.add_tooltip(deactivate_check, "Write external-only entries with a leading - in the exported modlist.")
-            self.add_tooltip(export_button, "Generate the modlist export with the selected options.")
-            self.add_tooltip(cancel_button, "Close the export options dialog without exporting.")
-            
-            self.root.wait_window(dialog)
-        
         output_path = filedialog.asksaveasfilename(
             title="Export modlist.txt",
             defaultextension=".txt",
             initialfile="modlist.txt",
-            filetypes=[
-                ("MO2 modlist", "modlist.txt"),
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
-            ],
+            filetypes=[("MO2 modlist", "modlist.txt"), ("Text files", "*.txt"), ("All files", "*.*")],
         )
         if not output_path:
             return
-
         try:
             output = Path(output_path)
             output.parent.mkdir(parents=True, exist_ok=True)
-            modlist_text = self.build_modlist_txt(
-                include_external_only=include_external_only,
-                deactivate_external_only=deactivate_external_only
-            )
-            output.write_text(modlist_text, encoding="utf-8", newline="")
+            modlist_text = self.build_modlist_txt()
+            with output.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(modlist_text)
             line_count = self.count_nonempty_lines(modlist_text)
-            base_count = len(self.mod_rows)
-            external_only_count = len(self.external_only_compare_names) if include_external_only else 0
-
-            export_type = "merged " if include_external_only else ""
-            deactivate_note = " (external-only deactivated)" if deactivate_external_only else ""
-            self.set_status(
-                f"Exported {export_type}modlist.txt: {output.name}{deactivate_note} "
-                f"({line_count} lines = {base_count} base + {external_only_count} external-only)"
-            )
+            self.set_status(f"Exported modlist.txt: {output.name} ({line_count} lines)")
             messagebox.showinfo(
                 "modlist.txt Exported",
-                f"Saved {export_type}modlist.txt to:\n{output}{deactivate_note}\n\n"
+                f"Saved authored modlist.txt to:\n{output}\n\n"
                 f"Line count: {line_count}\n"
-                f"Base rows: {base_count}\n"
-                f"External-only rows included: {external_only_count}\n"
                 "Order: MO2 file order (reverse of viewer top-to-bottom)."
             )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export modlist.txt: {e}")
 
     def get_separator_folder_names(self):
-        """Return base separator folder names in visible order, excluding external-only rows."""
+        """Return authored separator folder names in profile order."""
         seen = set()
         names = []
         for row in self.mod_rows:
-            if row.get("external_only") or row.get("compare_status") == "external_only":
-                continue
             if not row.get("is_separator"):
                 continue
             raw_name = str(row.get("raw_name") or "").strip()
@@ -1231,13 +1339,6 @@ class WabbajackGuideApp:
             seen.add(raw_name)
             names.append(raw_name)
         return names
-
-    def parse_external_entry_name(self, name):
-        """Parse external entry name and detect separators, return (display_name, is_separator)."""
-        raw_name = str(name or "").strip()
-        is_separator = raw_name.lower().endswith("_separator")
-        display_name = raw_name[:-10] if is_separator else raw_name
-        return display_name, is_separator
 
     def export_separators_zip(self):
         """Export all modlist separator folders (ending in _separator) as a zip."""
@@ -1281,195 +1382,7 @@ class WabbajackGuideApp:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export separators zip: {e}")
 
-    @staticmethod
-    def normalize_mod_key(raw_name):
-        """Build a case-insensitive comparison key for a mod folder name."""
-        return str(raw_name or "").strip().lower()
-
-    def parse_external_modlist_text(self, text):
-        """Parse an external modlist and return names in display order (including separators)."""
-        lines = []
-        for raw_line in str(text).splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            # MO2 modlist comments begin with '#'.
-            if line.startswith("#"):
-                continue
-            lines.append(line)
-        if not lines:
-            return []
-
-        prefixed = sum(1 for line in lines if line[:1] in "+-")
-        if prefixed >= max(1, len(lines) // 2):
-            entries = self.parse_modlist_entries("\n".join(lines))
-            return [entry["raw_name"] for entry in entries]
-
-        names = []
-        for line in lines:
-            raw_name = line[1:].strip() if line[:1] in "+-" else line
-            names.append(raw_name)
-        return names
-
-    def compare_with_external_modlist(self):
-        """Colorize rows by comparing against an external modlist.txt order."""
-        if not self.mod_rows:
-            messagebox.showwarning("No Data", "Load a Wabbajack file first.")
-            return
-
-        file_path = filedialog.askopenfilename(
-            title="Select external modlist.txt",
-            filetypes=[("modlist", "modlist.txt"), ("Text files", "*.txt"), ("All files", "*.*")],
-        )
-        if not file_path:
-            return
-
-        try:
-            text = Path(file_path).read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                text = Path(file_path).read_text(encoding="utf-8-sig")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to read modlist.txt: {e}")
-                return
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to read modlist.txt: {e}")
-            return
-
-        external_names = self.parse_external_modlist_text(text)
-        if not external_names:
-            messagebox.showwarning("No Entries", "The selected modlist.txt has no comparable mod entries.")
-            return
-
-        external_name_key_pairs = [(name, self.normalize_mod_key(name)) for name in external_names]
-        external_keys = [key for _, key in external_name_key_pairs]
-        wb_rows = list(self.mod_rows)
-        wb_keys = [self.normalize_mod_key(row.get("raw_name") or row.get("name")) for row in wb_rows]
-
-        for row in self.mod_rows:
-            row["compare_status"] = None
-        self.external_only_compare_names = []
-
-        # Use an LCS-style matcher (same family of idea as git diff) so stable subsequences stay green.
-        matcher = SequenceMatcher(None, wb_keys, external_keys, autojunk=False)
-        green_indices = set()
-        wb_to_external_index = {}
-        for a_start, _b_start, size in matcher.get_matching_blocks():
-            for index in range(a_start, a_start + size):
-                green_indices.add(index)
-        for a_start, b_start, size in matcher.get_matching_blocks():
-            for offset in range(size):
-                wb_to_external_index[a_start + offset] = b_start + offset
-
-        external_counts = Counter(external_keys)
-        consumed_counts = Counter()
-        used_external_indices = set()
-        for ext_index in wb_to_external_index.values():
-            used_external_indices.add(ext_index)
-
-        for index in green_indices:
-            row = wb_rows[index]
-            key = wb_keys[index]
-            row["compare_status"] = "green"
-            consumed_counts[key] += 1
-
-        external_indices_by_key = {}
-        for external_index, key in enumerate(external_keys):
-            external_indices_by_key.setdefault(key, []).append(external_index)
-
-        def claim_external_index_for_key(key):
-            indices = external_indices_by_key.get(key, [])
-            for external_index in indices:
-                if external_index not in used_external_indices:
-                    used_external_indices.add(external_index)
-                    return external_index
-            return None
-
-        for index, row in enumerate(wb_rows):
-            if row.get("compare_status") == "green":
-                continue
-            key = wb_keys[index]
-            if consumed_counts[key] < external_counts[key]:
-                row["compare_status"] = "yellow"
-                consumed_counts[key] += 1
-                external_index = claim_external_index_for_key(key)
-                if external_index is not None:
-                    wb_to_external_index[index] = external_index
-            else:
-                row["compare_status"] = "red"
-
-        consumed_pairs = sorted((external_index, wb_index) for wb_index, external_index in wb_to_external_index.items())
-        consumed_external_indices = [pair[0] for pair in consumed_pairs]
-
-        external_only = []
-        for external_index, (raw_name, _key) in enumerate(external_name_key_pairs):
-            if external_index in used_external_indices:
-                continue
-
-            insert_pos = bisect_left(consumed_external_indices, external_index)
-            prev_wb_index = consumed_pairs[insert_pos - 1][1] if insert_pos > 0 else None
-            next_wb_index = consumed_pairs[insert_pos][1] if insert_pos < len(consumed_pairs) else None
-
-            if prev_wb_index is not None and next_wb_index is not None:
-                insert_index = max(prev_wb_index + 1, 0)
-                insert_index = min(insert_index, next_wb_index)
-            elif prev_wb_index is not None:
-                insert_index = prev_wb_index + 1
-            elif next_wb_index is not None:
-                insert_index = next_wb_index
-            else:
-                insert_index = len(wb_rows)
-
-            external_only.append(
-                {
-                    "name": raw_name,
-                    "insert_index": int(insert_index),
-                    "external_index": external_index,
-                }
-            )
-
-        self.external_only_compare_names = external_only
-
-        self.external_compare_path = file_path
-        self.apply_filters_and_sort()
-        self.update_legend_visibility()
-
-        if hasattr(self, "clear_compare_button"):
-            self.clear_compare_button.config(state=tk.NORMAL)
-        if hasattr(self, "show_external_only_button"):
-            has_external_only = self.has_external_only_rows()
-            self.show_external_only_button.config(state=tk.NORMAL if has_external_only else tk.DISABLED)
-            if not has_external_only:
-                self.show_external_only_var.set(False)
-
-        green_count = sum(1 for row in self.mod_rows if row.get("compare_status") == "green")
-        yellow_count = sum(1 for row in self.mod_rows if row.get("compare_status") == "yellow")
-        red_count = sum(1 for row in self.mod_rows if row.get("compare_status") == "red")
-        external_only_count = len(self.external_only_compare_names)
-        self.set_status(
-            f"External compare: {green_count} green, {yellow_count} yellow, {red_count} red, {external_only_count} external-only"
-        )
-
-    def clear_compare_colors(self):
-        """Clear external compare statuses and remove row colorization."""
-        for row in self.mod_rows:
-            row["compare_status"] = None
-
-        self.external_only_compare_names = []
-        self.external_compare_path = None
-        if hasattr(self, "show_external_only_var"):
-            self.show_external_only_var.set(False)
-        self.apply_filters_and_sort()
-        self.update_legend_visibility()
-
-        if hasattr(self, "clear_compare_button"):
-            self.clear_compare_button.config(state=tk.DISABLED)
-        if hasattr(self, "show_external_only_button"):
-            self.show_external_only_button.config(state=tk.DISABLED)
-
-        self.set_status("Compare colors cleared")
-
-    def save_modlist(self):
+    def save_modlist(self, *, wait=False):
         """Save loaded data to a compact compressed modlist snapshot for fast reloads."""
         if not self.mod_rows:
             messagebox.showwarning("No Data", "Load a Wabbajack file first.")
@@ -1477,11 +1390,11 @@ class WabbajackGuideApp:
 
         default_name = "wabbajack_modlist.wvmodlist.json.gz"
         output_path = filedialog.asksaveasfilename(
-            title="Save Modlist",
+            title="Save mod list snapshot",
             defaultextension=".wvmodlist.json.gz",
             initialfile=default_name,
             filetypes=[
-                ("Wabbajack Viewer Modlist", "*.wvmodlist.json.gz"),
+                ("Mod list snapshot", "*.wvmodlist.json.gz"),
                 ("Legacy Viewer Cache", "*.wvjcache.json.gz"),
                 ("All files", "*.*"),
             ],
@@ -1489,6 +1402,22 @@ class WabbajackGuideApp:
         if not output_path:
             return
 
+        if not wait:
+            self._snapshot_requests.append((output_path, self.snapshot_payload()))
+            if self._save_thread is None:
+                self.start_session_write()
+            return
+
+        try:
+            self.set_status('Saving mod list snapshot…')
+            write_snapshot(output_path, self.snapshot_payload())
+            self.remember_saved_modlist_path(output_path)
+            self.set_status(f'Snapshot saved: {Path(output_path).name}')
+            messagebox.showinfo('Snapshot saved', f'Saved snapshot to:\n{output_path}')
+        except Exception as error:
+            messagebox.showerror('Error', f'Failed to save snapshot: {error}')
+
+    def snapshot_payload(self):
         cache_rows = []
         for row in self.mod_rows:
             serialized_row = {
@@ -1511,60 +1440,89 @@ class WabbajackGuideApp:
                     archive.get("Hash", "") for archive in row.get("source_archives", []) if archive.get("Hash")
                 ],
             }
+            checked = self._preferred_cache.get(self.preferred_key(row))
+            if checked:
+                serialized_row['verified_sources'] = {
+                    'path': checked['path'], 'signature': checked['signature'], 'message': checked['message'],
+                    'alternatives': {target: {'archive_hash': alternate['archive']['Hash'], 'member': alternate['member']}
+                                     for target, alternate in checked['alternatives'].items()}}
             cache_rows.append(serialized_row)
 
         payload = {
-            "snapshot_version": 1,
+            "snapshot_version": 2,
             "source_wabbajack": self.current_wabbajack_file,
             "modlist_data": self.modlist_data,
             "archives": self.archives,
             "active_profile": self.active_profile,
             "all_profile_paths": self.all_profile_paths,
-            "profile_ini_files": self.profile_ini_files,
             "mod_rows": cache_rows,
+            'profile_modlist_text': self.profile_modlist_text,
+            'ui_state': self.snapshot_ui_state(),
         }
+        model = getattr(self, 'package_model', None)
+        if model:
+            payload['model_cache'] = {'source_signature': model.source_signature, 'members': dict(model.members),
+                                      'text_cache': dict(model.text_cache)}
+        elif getattr(self, 'snapshot_model_cache', None):
+            payload['model_cache'] = self.snapshot_model_cache
+        return payload
 
-        try:
-            self.set_status("Saving modlist...")
-            with gzip.open(output_path, "wt", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False)
-            self.remember_saved_modlist_path(output_path)
-            self.set_status(f"Modlist saved: {output_path.split('\\')[-1]}")
-            messagebox.showinfo("Modlist Saved", f"Saved modlist to:\n{output_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save modlist: {e}")
+    def snapshot_ui_state(self):
+        return {'search': self.search_var.get(), 'sort_column': self.sort_column, 'sort_reverse': self.sort_reverse,
+                'selected_mod': (self.current_selected_row or {}).get('raw_name'),
+                'details_tab': self.notebook.tab(self.notebook.select(), 'text') if self.notebook.select() else 'Overview',
+                'sources_search': self.sources_search_var.get(), 'files_search': self.files_search_var.get(),
+                'sources_hide_mohidden': self.sources_hide_mohidden_var.get(),
+                'files_hide_mohidden': self.files_hide_mohidden_var.get(),
+                'comparison_settings_visible': self.comparison_view.settings_visible}
+
+    def restore_snapshot_ui(self, state):
+        if 'comparison_settings_visible' in state:
+            self.comparison_view.set_settings_visible(bool(state['comparison_settings_visible']))
+        self.sort_column = state.get('sort_column', 'number')
+        self.sort_reverse = bool(state.get('sort_reverse', False))
+        self.search_var.set(state.get('search', ''))
+        self.sources_search_var.set(state.get('sources_search', ''))
+        self.files_search_var.set(state.get('files_search', ''))
+        self.sources_hide_mohidden_var.set(bool(state.get('sources_hide_mohidden', False)))
+        self.files_hide_mohidden_var.set(bool(state.get('files_hide_mohidden', False)))
+        self.apply_filters_and_sort()
+        selected = next((item for item, row in self.row_by_item_id.items() if row['raw_name'] == state.get('selected_mod')), None)
+        if selected:
+            self.tree.selection_set(selected)
+            self.tree.see(selected)
+            self.on_mod_select(None)
+        for tab in self.notebook.tabs():
+            if self.notebook.tab(tab, 'text') == state.get('details_tab', 'Overview'):
+                self.notebook.select(tab)
+                break
 
     def load_saved_modlist(self):
         """Load a previously saved modlist snapshot without re-reading the full Wabbajack archive."""
         file_path = filedialog.askopenfilename(
-            title="Load Modlist",
+            title="Open mod list snapshot",
             filetypes=[
-                ("Wabbajack Viewer Modlist", "*.wvmodlist.json.gz"),
+                ("Mod list snapshot", "*.wvmodlist.json.gz"),
                 ("Legacy Viewer Cache", "*.wvjcache.json.gz"),
                 ("All files", "*.*"),
             ],
         )
         if not file_path:
             return
-        self.load_saved_modlist_from_path(file_path)
+        self.start_snapshot_load(file_path)
 
-    def extract_and_load_modlist(self, wabbajack_path):
+    def extract_and_load_modlist(self, wabbajack_path, notify=True):
         """Load modlist and inline profile files directly from the Wabbajack archive."""
+        previous = self.__dict__.copy()
         try:
+            self.current_wabbajack_file = str(wabbajack_path)
+            self.restored_from_snapshot = False
             self.loaded_from_saved_modlist = False
             self.set_status("Opening Wabbajack archive...")
             with zipfile.ZipFile(wabbajack_path, "r") as zip_ref:
                 self.set_status("Reading modlist metadata...")
-                modlist_files = [
-                    name for name in zip_ref.namelist() if name == "modlist" or name == "modlist.json"
-                ]
-                if not modlist_files:
-                    messagebox.showerror("Error", "No modlist file found in Wabbajack archive")
-                    return
-
-                modlist_file = modlist_files[0]
-                with zip_ref.open(modlist_file, "r") as handle:
-                    self.modlist_data = json.loads(handle.read().decode("utf-8"))
+                self.package_model = PackageModel(wabbajack_path, self.set_status)
+                self.modlist_data = self.package_model.manifest
 
                 self.archives = self.modlist_data.get("Archives", [])
                 self.directives = self.modlist_data.get("Directives", [])
@@ -1598,12 +1556,19 @@ class WabbajackGuideApp:
                 self.set_status("Building mod rows...")
                 self.update_ui_after_load()
 
-                messagebox.showinfo(
+                if notify:
+                    messagebox.showinfo(
                     "Success",
-                    f"Successfully loaded modlist from:\n{wabbajack_path.split('\\\\')[-1]}",
-                )
+                    f"Successfully loaded modlist from:\n{Path(wabbajack_path).name}",
+                    )
+                return True
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load Wabbajack file: {e}")
+            self.__dict__.update(previous)
+            self.update_ui_after_load(prepare_rows=False)
+            self.load_error = str(e)
+            if notify:
+                messagebox.showerror("Error", f"Failed to load Wabbajack file: {e}")
+            return False
 
     def build_archive_name_index(self):
         """Create a fast lowercase name -> archive mapping."""
@@ -1667,24 +1632,16 @@ class WabbajackGuideApp:
     @staticmethod
     def parse_meta_ini(meta_text):
         """Parse MO2 meta.ini content into a compact metadata dict."""
-        parser = configparser.RawConfigParser()
-        parser.optionxform = str
-
-        try:
-            parser.read_string(meta_text)
-        except configparser.Error:
-            return {}
-
-        general = dict(parser.items("General")) if parser.has_section("General") else {}
+        general = general_metadata(meta_text)
         return {
-            "installation_file": general.get("installationFile", "").strip(),
+            "installation_file": general.get("installationfile", "").strip(),
             "repository": general.get("repository", "").strip(),
             "modid": general.get("modid", "").strip(),
             "version": general.get("version", "").strip(),
             "url": general.get("url", "").strip(),
             "comments": general.get("comments", "").strip(),
             "notes": general.get("notes", "").strip(),
-            "game_name": general.get("gameName", "").strip(),
+            "game_name": general.get("gamename", "").strip(),
         }
 
     def build_mod_folder_meta_paths(self):
@@ -1716,11 +1673,13 @@ class WabbajackGuideApp:
             return None
 
         try:
-            if zip_ref is None:
+            if hasattr(self, "package_model"):
+                text = self.package_model.read_text(normalized)
+            elif zip_ref is None:
                 with zipfile.ZipFile(self.current_wabbajack_file, "r") as local_zip_ref:
-                    text = local_zip_ref.read(source_data_id).decode("utf-8", errors="replace")
+                    text = local_zip_ref.read(source_data_id).decode("utf-8-sig", errors="replace")
             else:
-                text = zip_ref.read(source_data_id).decode("utf-8", errors="replace")
+                text = zip_ref.read(source_data_id).decode("utf-8-sig", errors="replace")
         except Exception:
             return None
 
@@ -1829,8 +1788,8 @@ class WabbajackGuideApp:
         for file_info in file_list:
             archive_path = file_info.get("archive_path", "")
             archive_hash = file_info.get("archive_hash", "")
-            if archive_hash:
-                counts[archive_hash] = counts.get(archive_hash, 0) + 1
+            for source_hash in set(file_info.get("generated_source_hashes", []) + ([archive_hash] if archive_hash else [])):
+                counts[source_hash] = counts.get(source_hash, 0) + 1
         return counts
 
     @staticmethod
@@ -1840,27 +1799,27 @@ class WabbajackGuideApp:
             return {"page": "", "download": ""}
 
         state = archive.get("State", {})
-        mod_type = state.get("$type", "")
+        mod_type = downloader_type(state.get("$type"))
         page_link = ""
         direct_link = ""
 
-        if "NexusDownloader" in mod_type:
-            mod_id = state.get("ModID")
-            file_id = state.get("FileID")
-            game_name = str(state.get("GameName", "skyrimspecialedition")).lower()
-            if game_name == "skyrimspecialedition":
-                game_name = "skyrimspecialedition"
-            if mod_id:
-                page_link = f"https://www.nexusmods.com/{game_name}/mods/{mod_id}"
-            if mod_id and file_id:
-                direct_link = f"https://www.nexusmods.com/{game_name}/mods/{mod_id}?tab=files&file_id={file_id}"
-        elif "HttpDownloader" in mod_type:
-            direct_link = state.get("Url", "")
+        if mod_type == "Nexus":
+            values = metadata(archive.get("Meta", ""), state.get("GameName", ""))
+            values["mod_id"] = positive_id(state.get("ModID") or values["mod_id"])
+            values["file_id"] = positive_id(state.get("FileID") or values["file_id"])
+            links = source_links(values)
+            page_link = links[0] if links else ""
+            direct_link = next((link for link in links if "file_id=" in link), "")
+        else:
+            values = general_metadata(archive.get("Meta", ""))
+            direct_link = safe_url(state.get("Url") or values.get("directurl"))
 
         return {"page": page_link, "download": direct_link}
 
     def load_inline_file_sources(self, zip_ref):
         """Load InlineFile target path -> SourceDataID mapping without decoding payloads."""
+        if hasattr(self, 'package_model'):
+            return {key.replace('/', '\\'): value for key, value in self.package_model.inline_sources.items()}
         inline_sources_by_to = {}
         archive_entries = set(zip_ref.namelist())
         total = len(self.directives)
@@ -1869,7 +1828,7 @@ class WabbajackGuideApp:
             if index % 2500 == 0:
                 self.set_status(f"Indexing InlineFiles: {index}/{total}")
 
-            if directive.get("$type") != "InlineFile":
+            if directive_type(directive.get("$type")) not in {"InlineFile", "RemappedInlineFile", "PropertyFile"}:
                 continue
 
             target_path = directive.get("To")
@@ -1886,15 +1845,14 @@ class WabbajackGuideApp:
         return inline_sources_by_to
 
     def load_profile_inline_data(self, preferred_profile=None, zip_ref=None):
-        """Pick a profile modlist and load ini files for that profile."""
+        """Pick and load the authored profile modlist."""
         self.active_profile = None
         self.profile_modlist_text = ""
-        self.profile_ini_files = {}
 
         modlist_paths = sorted(
             path
             for path in self.inline_file_sources.keys()
-            if path.endswith("\\modlist.txt")
+            if len(path.split("\\")) == 3 and path.startswith("profiles\\") and path.endswith("\\modlist.txt")
         )
         self.all_profile_paths = modlist_paths
 
@@ -1903,7 +1861,7 @@ class WabbajackGuideApp:
 
         if preferred_profile:
             match = next(
-                (p for p in modlist_paths if p.rsplit("\\", 1)[0].split("\\")[-1] == preferred_profile),
+                (p for p in modlist_paths if p.rsplit("\\", 1)[0].split("\\")[-1].casefold() == preferred_profile.casefold()),
                 None,
             )
             selected_modlist_path = match if match else modlist_paths[0]
@@ -1913,99 +1871,49 @@ class WabbajackGuideApp:
         self.profile_modlist_text = self.read_inline_text(selected_modlist_path, zip_ref=zip_ref) or ""
         self.active_profile = selected_modlist_path.rsplit("\\", 1)[0]
 
-        for ini_name in ("skyrim.ini", "skyrimprefs.ini", "skyrimcustom.ini"):
-            ini_path = f"{self.active_profile}\\{ini_name}"
-            ini_text = self.read_inline_text(ini_path, zip_ref=zip_ref)
-            if ini_text is not None:
-                self.profile_ini_files[ini_name] = ini_text
-
     def on_profile_selected(self, event=None):
         """Switch to the selected profile."""
+        if self.loaded_from_saved_modlist:
+            messagebox.showinfo("Saved profile", "Open the original .wabbajack file to select another authored profile.")
+            return
         selected = self.profile_var.get()
-        self.load_profile_inline_data(preferred_profile=selected)
-        self.update_ui_after_load()
+        if selected.casefold() == self.selected_profile_name().casefold():
+            self.refresh_profile_selector()
+            return
+        self.comparison_view.set_package_context(self.package_model, self.selected_profile_name())
+        self.start_document_load(self.current_wabbajack_file, profile=selected)
 
-    def update_ui_after_load(self, prepare_rows=True):
+    def update_ui_after_load(self, prepare_rows=True, verify_sources=True):
         """Update UI elements after loading modlist data."""
+        self.clear_mod_details()
         if self.modlist_data:
             self.root.title(
-                f"Wabbajack Manual Installation Guide - {self.modlist_data.get('Name', 'Unknown Modlist')}"
+                f"Wabbajack Viewer - {self.modlist_data.get('Name', 'Unknown Modlist')}"
             )
 
-        if hasattr(self, "info_text") and self.modlist_data:
-            info_text = (
-                f"Name: {self.modlist_data.get('Name', 'Unknown')}\n"
-                f"Author: {self.modlist_data.get('Author', 'Unknown')}\n"
-                f"Version: {self.modlist_data.get('Version', 'Unknown')}\n"
-                f"Game: {self.modlist_data.get('GameType', 'Unknown')}\n"
-                f"Description: {self.modlist_data.get('Description', 'No description available')}\n"
-                f"Wabbajack Version: {self.modlist_data.get('WabbajackVersion', 'Unknown')}\n"
-                f"Archives: {len(self.archives)}"
-            )
-            if self.active_profile:
-                profile_name = self.active_profile.split("\\")[-1]
-                info_text += f"\nProfile: {profile_name}"
-            if self.loaded_from_saved_modlist:
-                info_text += "\nLoaded from saved modlist"
-
-            self.info_text.config(state=tk.NORMAL)
-            self.info_text.delete(1.0, tk.END)
-            self.info_text.insert(1.0, info_text)
-            self.info_text.config(state=tk.DISABLED)
-            self.update_info_height(info_text)
-
-        self.refresh_ini_buttons()
         self.refresh_profile_selector()
         if prepare_rows:
-            self.prepare_mod_rows()
-        else:
-            self.apply_filters_and_sort()
+            self.prepare_mod_rows(render=False)
+        if verify_sources:
+            self.verify_sources_before_display()
+        self.apply_filters_and_sort()
+        first = next((item for item, row in self.row_by_item_id.items() if not row.get('is_separator')), None)
+        if first:
+            self.tree.selection_set(first)
+            self.tree.see(first)
+            self.on_mod_select(None)
 
-        if hasattr(self, "export_modlist_button"):
-            self.export_modlist_button.config(state=tk.NORMAL if self.mod_rows else tk.DISABLED)
-        if hasattr(self, "export_separators_button"):
-            has_separators = bool(self.get_separator_folder_names()) if self.mod_rows else False
-            self.export_separators_button.config(state=tk.NORMAL if has_separators else tk.DISABLED)
-        if hasattr(self, "compare_modlist_button"):
-            self.compare_modlist_button.config(state=tk.NORMAL if self.mod_rows else tk.DISABLED)
-        if hasattr(self, "clear_compare_button"):
-            has_compare = self.has_active_compare_colors()
-            self.clear_compare_button.config(state=tk.NORMAL if has_compare else tk.DISABLED)
-        if hasattr(self, "show_external_only_button"):
-            has_external_only = self.has_external_only_rows()
-            self.show_external_only_button.config(state=tk.NORMAL if has_external_only else tk.DISABLED)
-            if not has_external_only:
-                self.show_external_only_var.set(False)
-        self.update_legend_visibility()
-
+        self.sync_workflow()
         if hasattr(self, "status_var"):
-            self.status_var.set("Modlist loaded")
-
-    def update_info_height(self, content_text):
-        """Resize modlist info area to content lines."""
-        if not hasattr(self, "info_text"):
-            return
-        line_count = max(4, len(str(content_text).splitlines()) + 1)
-        self.info_text.configure(height=line_count)
-
-    def toggle_modlist_info(self):
-        """Collapse or expand modlist information frame."""
-        if not hasattr(self, "info_frame"):
-            return
-
-        if self.info_frame.winfo_ismapped():
-            self.info_frame.grid_remove()
-            self.info_toggle_button.config(text="Show Modlist Info")
-        else:
-            self.info_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-            self.info_toggle_button.config(text="Hide Modlist Info")
+            self.status_var.set("Wabbajack loaded" if not self.loaded_from_saved_modlist else "Snapshot loaded")
+        self.update_preferred_source_progress()
 
     def process_directives(self):
         """Process archive-backed and embedded directives for folder-level source relationships."""
         total = len(self.directives)
         for index, directive in enumerate(self.directives, start=1):
-            directive_type = directive.get("$type")
-            if directive_type not in self.SOURCE_DIRECTIVE_TYPES and directive_type != "InlineFile":
+            kind = directive_type(directive.get("$type"))
+            if not str(directive.get("To", "")).replace("/", "\\").lower().startswith("mods\\"):
                 continue
 
             if index % 2500 == 0:
@@ -2014,24 +1922,21 @@ class WabbajackGuideApp:
             archive_hash = ""
             archive_path = ""
             source_data_id = ""
-            if directive_type in self.SOURCE_DIRECTIVE_TYPES:
+            if kind in self.SOURCE_DIRECTIVE_TYPES:
                 archive_hash = (
                     directive.get("ArchiveHashPath", [""])[0]
                     if directive.get("ArchiveHashPath")
                     else ""
                 )
-                archive_path = (
-                    directive.get("ArchiveHashPath", ["", ""])[1]
-                    if len(directive.get("ArchiveHashPath", [])) > 1
-                    else ""
-                )
-            elif directive_type == "InlineFile":
+                archive_path = " → ".join(str(part) for part in (directive.get("ArchiveHashPath") or [])[1:])
+            elif kind in {"InlineFile", "RemappedInlineFile", "PropertyFile"}:
                 source_data_id = str(directive.get("SourceDataID", "")).strip()
                 if not source_data_id:
                     continue
                 archive_path = f"[Embedded InlineFile] {source_data_id}"
 
             target_path = str(directive.get("To", "")).replace("/", "\\")
+            package_path(target_path)
             if target_path.lower().startswith("mods\\"):
                 if self.is_mod_meta_file_path(target_path):
                     continue
@@ -2039,7 +1944,7 @@ class WabbajackGuideApp:
                 if len(parts) >= 2:
                     folder_name = parts[1].strip().lower()
                     if folder_name:
-                        if directive_type == "InlineFile":
+                        if kind in {"InlineFile", "RemappedInlineFile", "PropertyFile"}:
                             archive_hash = f"{self.INLINE_SOURCE_PREFIX}{folder_name}"
                             if archive_hash not in self.synthetic_archive_by_hash:
                                 self.synthetic_archive_by_hash[archive_hash] = self.build_inline_archive_record(
@@ -2058,27 +1963,32 @@ class WabbajackGuideApp:
                                 "archive_hash": archive_hash,
                                 "source_data_id": source_data_id,
                                 "size": directive.get("Size", 0),
-                                "directive_type": directive_type or "",
+                                "directive_type": kind,
+                                "hash": directive.get("Hash"),
+                                "archive_depth": len(directive.get("ArchiveHashPath") or []),
+                                "archive_hash_path": list(directive.get("ArchiveHashPath") or []),
+                                "generated_source_hashes": self.package_model.source_hashes(directive) if hasattr(self, "package_model") else [],
                             }
                         )
                         folder_hashes = self.mod_folder_archive_hashes.setdefault(folder_name, [])
                         if archive_hash and archive_hash not in folder_hashes:
                             folder_hashes.append(archive_hash)
+                        if hasattr(self, "package_model"):
+                            for source_hash in self.package_model.source_hashes(directive):
+                                if source_hash not in folder_hashes:
+                                    folder_hashes.append(source_hash)
 
     def parse_modlist_entries(self, modlist_text):
         """Parse modlist.txt entries and convert reverse order to display order."""
-        lines = [line.strip() for line in modlist_text.splitlines() if line.strip()]
         entries = []
-
-        for line in lines:
-            prefix = line[0] if line and line[0] in "+-*" else "+"
-            raw_name = line[1:].strip() if line and line[0] in "+-*" else line
+        for parsed in mod_entries(modlist_text, strict=False):
+            prefix, raw_name = parsed["prefix"], parsed["name"]
             is_separator = raw_name.lower().endswith("_separator")
             display_name = raw_name[:-10] if is_separator else raw_name
 
             entries.append(
                 {
-                    "raw_line": line,
+                    "raw_line": prefix + raw_name,
                     "name": display_name,
                     "raw_name": raw_name,
                     "active": prefix in "+*",
@@ -2087,17 +1997,11 @@ class WabbajackGuideApp:
                 }
             )
 
-        # Wabbajack stores this list in reverse order for MO2 display purposes.
-        entries.reverse()
         return entries
 
-    def prepare_mod_rows(self):
+    def prepare_mod_rows(self, render=True):
         """Build table rows from profile modlist order, with archive metadata if available."""
         self.mod_rows = []
-        self.external_only_compare_names = []
-        self.external_compare_path = None
-        if hasattr(self, "show_external_only_var"):
-            self.show_external_only_var.set(False)
 
         if self.profile_modlist_text:
             parsed_entries = self.parse_modlist_entries(self.profile_modlist_text)
@@ -2147,7 +2051,6 @@ class WabbajackGuideApp:
                         "folder_files": folder_files,
                         "source_file_counts": source_file_counts,
                         "archive": archive,
-                        "compare_status": None,
                     }
                 )
         else:
@@ -2171,181 +2074,136 @@ class WabbajackGuideApp:
                         "archive_hash": archive.get("Hash", ""),
                         "archive_name": archive.get("Name", ""),
                         "archive": archive,
-                        "compare_status": None,
                     }
                 )
 
-        self.apply_filters_and_sort()
+        if render:
+            self.apply_filters_and_sort()
 
     def setup_ui(self):
         """Setup the main UI components."""
         main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        main_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(2, weight=1)
+        self.activity = ActivityBanner(main_frame)
 
         header_frame = ttk.Frame(main_frame)
+        self.header_frame = header_frame
         header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        header_frame.columnconfigure(0, weight=1)
 
         self.title_label = ttk.Label(
             header_frame,
-            text="Wabbajack Manual Installation Guide",
-            font=("Arial", 16, "bold"),
+            text="Wabbajack Viewer",
+            font=("Arial", 16, "bold"), wraplength=360, justify=tk.LEFT,
         )
-        self.title_label.pack()
+        self.title_label.grid(row=0, column=0, sticky='w', padx=(0, 20))
 
         button_frame = ttk.Frame(header_frame)
-        button_frame.pack(fill=tk.X, pady=(5, 0))
+        button_frame.grid(row=0, column=1, sticky='ne')
         self.header_button_frame = button_frame
         self.header_toolbar_widgets = []
 
-        load_button = ttk.Button(button_frame, text="Load Wabbajack File", command=self.load_wabbajack_file)
+        load_button = ttk.Button(button_frame, text="Open Wabbajack…", style='Accent.TButton', command=self.load_wabbajack_file)
+        self.open_button = load_button
         self.header_toolbar_widgets.append((load_button, (0, 8)))
         self.add_tooltip(load_button, "Open a .wabbajack file and build the mod list from its embedded data.")
+        self.cancel_load_button = self.activity.cancel_button
+        self.setup_menus()
 
-        load_cache_button = ttk.Button(button_frame, text="Load Modlist", command=self.load_saved_modlist)
-        self.header_toolbar_widgets.append((load_cache_button, (0, 8)))
-        self.add_tooltip(load_cache_button, "Load a saved viewer snapshot instead of rereading the archive.")
-
-        save_cache_button = ttk.Button(button_frame, text="Save Modlist", command=self.save_modlist)
-        self.header_toolbar_widgets.append((save_cache_button, (0, 8)))
-        self.add_tooltip(save_cache_button, "Save the current loaded data to a compact snapshot file.")
-
-        self.info_toggle_button = ttk.Button(
-            button_frame,
-            text="Hide Modlist Info",
-            command=self.toggle_modlist_info,
-        )
-        self.header_toolbar_widgets.append((self.info_toggle_button, (0, 8)))
-        self.add_tooltip(self.info_toggle_button, "Show or hide the modlist metadata pane.")
-
-        self.export_modlist_button = ttk.Button(
-            button_frame,
-            text="Export modlist.txt",
-            command=self.export_modlist_txt,
-            state=tk.DISABLED,
-        )
-        self.header_toolbar_widgets.append((self.export_modlist_button, (0, 8)))
-        self.add_tooltip(self.export_modlist_button, "Export the current load order as an MO2 modlist.txt file.")
-
-        self.export_separators_button = ttk.Button(
-            button_frame,
-            text="Export Separators",
-            command=self.export_separators_zip,
-            state=tk.DISABLED,
-        )
-        self.header_toolbar_widgets.append((self.export_separators_button, (0, 8)))
-        self.add_tooltip(self.export_separators_button, "Export separator folders as an empty zip scaffold.")
-
-        self.compare_modlist_button = ttk.Button(
-            button_frame,
-            text="Compare modlist.txt",
-            command=self.compare_with_external_modlist,
-            state=tk.DISABLED,
-        )
-        self.header_toolbar_widgets.append((self.compare_modlist_button, (0, 8)))
-        self.add_tooltip(self.compare_modlist_button, "Compare the loaded list with an external modlist.txt.")
-
-        self.clear_compare_button = ttk.Button(
-            button_frame,
-            text="Clear Compare Colors",
-            command=self.clear_compare_colors,
-            state=tk.DISABLED,
-        )
-        self.header_toolbar_widgets.append((self.clear_compare_button, (0, 8)))
-        self.add_tooltip(self.clear_compare_button, "Clear compare coloring and restore the normal view.")
-
-        self.show_external_only_var = tk.BooleanVar(value=False)
-        self.show_external_only_button = ttk.Checkbutton(
-            button_frame,
-            text="Show External-Only",
-            variable=self.show_external_only_var,
-            command=self.on_toggle_show_external_only,
-            state=tk.DISABLED,
-        )
-        self.header_toolbar_widgets.append((self.show_external_only_button, (0, 8)))
-        self.add_tooltip(self.show_external_only_button, "Show mods that only exist in the external comparison list.")
-
-        self.profile_label = ttk.Label(button_frame, text="Profile:")
+        self.profile_frame = ttk.Frame(header_frame)
+        self.profile_frame.grid(row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.profile_label = ttk.Label(self.profile_frame, text="Wabbajack profile:", style='Muted.TLabel')
         self.header_toolbar_widgets.append((self.profile_label, (8, 2)))
         self.add_tooltip(self.profile_label, "Choose which profile folder inside the archive to load.")
         self.profile_var = tk.StringVar()
         self.profile_combobox = ttk.Combobox(
-            button_frame, textvariable=self.profile_var, state="readonly", width=20
+            self.profile_frame, textvariable=self.profile_var, state="readonly", width=20
         )
         self.header_toolbar_widgets.append((self.profile_combobox, (0, 8)))
         self.add_tooltip(self.profile_combobox, "Select a different Wabbajack profile from the archive.")
         self.profile_combobox.bind("<<ComboboxSelected>>", self.on_profile_selected)
         self.profile_combobox.config(state=tk.DISABLED)
 
-        self.ini_buttons = {}
-        for ini_name in ("skyrim.ini", "skyrimprefs.ini", "skyrimcustom.ini"):
-            button = ttk.Button(
-                button_frame,
-                text=f"View {ini_name}",
-                command=lambda value=ini_name: self.open_ini_viewer(value),
-                state=tk.DISABLED,
-            )
-            self.header_toolbar_widgets.append((button, (0, 8)))
-            self.add_tooltip(button, f"Open the embedded {ini_name} from the loaded Wabbajack data.")
-            self.ini_buttons[ini_name] = button
+        self.source_var = tk.StringVar(value='No Wabbajack open.')
+        self.source_label = ttk.Label(header_frame, textvariable=self.source_var, wraplength=1100, justify=tk.LEFT)
+        self.source_label.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 0))
+        self.source_tooltip = Tooltip(self.title_label, '')
+        header_frame.bind('<Configure>', lambda event: self.source_label.configure(wraplength=max(200, event.width - 20)))
 
         self.layout_header_buttons()
         self.header_button_frame.bind("<Configure>", self.on_header_button_frame_configure)
 
-        self.info_frame = ttk.LabelFrame(main_frame, text="Modlist Information", padding="5")
-        self.info_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        self.info_text = scrolledtext.ScrolledText(self.info_frame, height=8, wrap=tk.WORD, font=("TkDefaultFont", 9))
-        self.info_text.insert(1.0, "No modlist loaded. Click 'Load Wabbajack File' to begin.")
-        self.info_text.config(state=tk.DISABLED)
-        self.info_text.pack(fill=tk.BOTH, expand=False)
-        self.update_info_height("No modlist loaded. Click 'Load Wabbajack File' to begin.")
-
-        content_frame = ttk.Frame(main_frame)
-        content_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.workspace = ttk.Notebook(main_frame)
+        self.workspace.grid(row=2, column=0, sticky='nsew')
+        content_frame = ttk.Frame(self.workspace)
+        self.workbench_page = ttk.Frame(self.workspace)
+        self.workspace.add(content_frame, text='Mods')
+        self.workspace.add(self.workbench_page, text='Create profile copy')
+        self.mods_page = content_frame
+        self.comparison_view = None
+        self.workbench_view = None
+        self.workspace.bind('<<NotebookTabChanged>>', self.on_workspace_selected)
         content_frame.columnconfigure(0, weight=1)
-        content_frame.rowconfigure(2, weight=1)
+        content_frame.rowconfigure(3, weight=1)
 
-        search_frame = ttk.Frame(content_frame, padding=(6, 4))
-        search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 6))
+        self.mods_toolbar = ttk.Frame(content_frame, padding=(6, 4))
+        self.mods_toolbar.grid(row=1, column=0, sticky='ew')
+        self.mods_toolbar.columnconfigure(0, weight=1)
+        search_frame = ttk.Frame(self.mods_toolbar)
+        self.search_frame = search_frame
+        search_frame.grid(row=0, column=0, sticky='w', padx=(0, 12))
+        search_frame.columnconfigure(1, weight=1)
+        ttk.Label(search_frame, text="Find mods:").grid(row=0, column=0, padx=(0, 6))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.filter_mods)
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=56)
-        search_entry.pack(side=tk.LEFT)
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=40)
+        search_entry.grid(row=0, column=1, sticky='ew')
+        search_entry.bind('<Escape>', lambda event: self.search_var.set(''))
+        self.clear_search_button = ttk.Button(search_frame, text='×', width=3, command=lambda: self.search_var.set(''))
+        self.clear_search_button.grid(row=0, column=2, padx=(4, 0))
+        self.clear_search_button.grid_remove()
+        self.add_tooltip(self.clear_search_button, 'Clear search (Escape)')
+        self.list_count_var = tk.StringVar()
+        ttk.Label(search_frame, textvariable=self.list_count_var, style='Muted.TLabel').grid(row=0, column=4, padx=(8, 0))
+        from comparison_presenter import FILTERS
+        self.comparison_filter = tk.StringVar(value='All mods')
+        self.comparison_filter_box = ttk.Combobox(search_frame, textvariable=self.comparison_filter,
+            values=FILTERS, state='readonly', width=21)
+        self.comparison_filter_box.grid(row=0, column=3, padx=(8, 0))
+        self.comparison_filter_box.grid_remove()
+        self.comparison_filter.trace_add('write', self.filter_mods)
+
 
         self.legend_frame = ttk.Frame(content_frame, padding=(6, 0, 6, 4))
-        self.legend_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
-        ttk.Label(self.legend_frame, text="Legend:").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Label(self.legend_frame, text="Green = in external and in order", fg="#1f7a1f").pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(self.legend_frame, text="Yellow = in external but wrong order", fg="#b8860b").pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(self.legend_frame, text="Red = missing from external", fg="#b22222").pack(side=tk.LEFT)
-        tk.Label(self.legend_frame, text="Blue = external-only (not in Wabbajack)", fg="#1f4d99").pack(side=tk.LEFT, padx=(8, 0))
+        self.legend_frame.grid(row=2, column=0, sticky=(tk.W, tk.E))
         self.legend_frame.grid_remove()
 
         paned_window = ttk.PanedWindow(content_frame, orient=tk.VERTICAL)
-        paned_window.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.mod_details_panes = paned_window
+        paned_window.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        mod_frame = ttk.LabelFrame(paned_window, text="Mod List", padding="10")
+        mod_frame = ttk.Frame(paned_window, padding=(6, 0, 6, 0))
         mod_frame.columnconfigure(0, weight=1)
         mod_frame.rowconfigure(0, weight=1)
 
         self.tree = ttk.Treeview(
             mod_frame,
-            columns=("active", "name", "sources", "author", "version", "size"),
+            columns=("active", "name", "sources", "author", "version", "size", 'result', 'local_name', 'local_version', 'local_order', 'local_active'),
+            displaycolumns=('active', 'name', 'sources', 'author', 'version', 'size'),
             show="tree headings",
         )
         self.tree.heading("#0", text="#", command=lambda: self.sort_by("number"))
         self.tree.heading("active", text="Active", command=lambda: self.sort_by("active"))
-        self.tree.heading("name", text="Mod Name", command=lambda: self.sort_by("name"))
-        self.tree.heading("sources", text="Sources", command=lambda: self.sort_by("sources"))
-        self.tree.heading("author", text="Author", command=lambda: self.sort_by("author"))
-        self.tree.heading("version", text="Version", command=lambda: self.sort_by("version"))
-        self.tree.heading("size", text="Size (MB)", command=lambda: self.sort_by("size"))
+        self.tree.heading("name", text="Mod name", anchor=tk.W, command=lambda: self.sort_by("name"))
+        self.tree.heading("sources", text="Archives", command=lambda: self.sort_by("sources"))
+        self.tree.heading("author", text="Author", anchor=tk.W, command=lambda: self.sort_by("author"))
+        self.tree.heading("version", text="Version", anchor=tk.W, command=lambda: self.sort_by("version"))
+        self.tree.heading("size", text="Downloads (MiB)", command=lambda: self.sort_by("size"))
 
         self.tree.column("#0", width=50, minwidth=40, anchor=tk.CENTER, stretch=False)
         self.tree.column("active", width=55, minwidth=50, anchor=tk.CENTER, stretch=False)
@@ -2354,48 +2212,83 @@ class WabbajackGuideApp:
         self.tree.column("author", width=130, minwidth=80)
         self.tree.column("version", width=80, minwidth=50)
         self.tree.column("size", width=70, minwidth=55, anchor=tk.E, stretch=False)
+        for column, title, width in (('result', 'Result', 185), ('local_name', 'Installed mod', 245),
+                ('local_version', 'Installed version', 105), ('local_order', 'Installed #', 82), ('local_active', 'Installed active', 100)):
+            self.tree.heading(column, text=title, command=lambda column=column: self.sort_by(column))
+            self.tree.column(column, width=width, minwidth=65)
 
         tree_scroll = ttk.Scrollbar(mod_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
 
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         tree_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        horizontal = ttk.Scrollbar(mod_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        horizontal.grid(row=1, column=0, sticky='ew')
+        self.mod_horizontal = horizontal
+        def update_horizontal(first, last):
+            horizontal.set(first, last)
+            if float(first) <= 0 and float(last) >= 1:
+                horizontal.grid_remove()
+            else:
+                horizontal.grid()
+        self.tree.configure(xscrollcommand=update_horizontal)
 
         self.separator_font = tkfont.Font(font="TkDefaultFont")
-        self.separator_font.configure(size=self.separator_font.cget("size") + 1, weight="bold")
-        self.tree.tag_configure("separator", font=self.separator_font)
-        self.tree.tag_configure("compare_green", foreground="#1f7a1f")
-        self.tree.tag_configure("compare_yellow", foreground="#b8860b")
-        self.tree.tag_configure("compare_red", foreground="#b22222")
-        self.tree.tag_configure("compare_external_only", foreground="#1f4d99")
+        self.separator_font.configure(weight="bold")
+        self.tree.tag_configure("separator", font=self.separator_font, background=COLORS['group'], foreground=COLORS['muted'])
+        self.tree.tag_configure("compare_green", foreground=COLORS['green'])
+        self.tree.tag_configure("compare_yellow", foreground=COLORS['amber'])
+        self.tree.tag_configure("compare_red", foreground=COLORS['red'])
+        self.tree.tag_configure("compare_external_only", foreground=COLORS['blue'])
 
-        details_frame = ttk.LabelFrame(paned_window, text="Mod Details", padding="10")
+        details_frame = ttk.Frame(paned_window, padding=(6, 6, 6, 0))
+        self.details_frame = details_frame
         details_frame.columnconfigure(0, weight=1)
-        details_frame.rowconfigure(0, weight=1)
+        details_frame.rowconfigure(1, weight=1)
+        self.details_title = tk.StringVar(value='Select a mod')
+        details_heading = ttk.Label(details_frame, textvariable=self.details_title,
+                                    font=('TkDefaultFont', 11, 'bold'), wraplength=800)
+        details_heading.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        details_frame.bind('<Configure>', lambda event: details_heading.configure(
+            wraplength=max(200, event.width - 12)))
+        self.details_toggle = ttk.Button(details_frame, text='Hide details', command=self.toggle_details)
+        self.details_toggle.grid(row=0, column=1, sticky='e', padx=(8, 0), pady=(0, 6))
+        self.show_details_button = ttk.Button(search_frame, text='Show details', command=self.toggle_details)
+        self.show_details_button.grid(row=0, column=5, padx=(8, 0))
+        self.show_details_button.grid_remove()
 
         self.notebook = ttk.Notebook(details_frame)
-        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.notebook.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         overview_frame = ttk.Frame(self.notebook)
         self.notebook.add(overview_frame, text="Overview")
 
-        self.overview_text = scrolledtext.ScrolledText(overview_frame, wrap=tk.WORD)
+        self.overview_text = ReadOnlyText(overview_frame, wrap=tk.WORD)
         self.overview_text.pack(fill=tk.BOTH, expand=True)
 
-        self.overview_text.tag_configure("link", foreground="blue", underline=True)
+        self.overview_text.tag_configure("link", foreground=COLORS['accent'], underline=True)
         self.overview_text.tag_bind("link", "<Button-1>", self.open_link)
         self.overview_text.tag_bind("link", "<Enter>", lambda e: self.overview_text.config(cursor="hand2"))
         self.overview_text.tag_bind("link", "<Leave>", lambda e: self.overview_text.config(cursor=""))
 
+        self.comparison_detail_frame = ttk.Frame(self.notebook)
+        self.comparison_detail_text = scrolledtext.ScrolledText(self.comparison_detail_frame, wrap=tk.WORD, state=tk.DISABLED)
+        style_text(self.comparison_detail_text)
+        self.comparison_detail_text.pack(fill=tk.BOTH, expand=True)
+        self.open_local_button = ttk.Button(self.comparison_detail_frame, text='Open installed mod folder',
+            command=self.open_installed_mod_folder, state=tk.DISABLED)
+        self.open_local_button.pack(anchor='w', pady=4)
+
         sources_frame = ttk.Frame(self.notebook)
-        self.notebook.add(sources_frame, text="Sources")
+        self.notebook.add(sources_frame, text="Install Instructions")
 
         sources_search_frame = ttk.Frame(sources_frame)
         sources_search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
-        ttk.Label(sources_search_frame, text="Search Sources:").pack(side=tk.LEFT, padx=(0, 6))
+        sources_search_frame.columnconfigure(1, weight=1)
+        ttk.Label(sources_search_frame, text="Find instructions:").grid(row=0, column=0, padx=(0, 6))
         self.sources_search_var = tk.StringVar()
         self.sources_search_var.trace_add("write", self.on_sources_search_changed)
-        ttk.Entry(sources_search_frame, textvariable=self.sources_search_var, width=48).pack(side=tk.LEFT)
+        ttk.Entry(sources_search_frame, textvariable=self.sources_search_var, width=20).grid(row=0, column=1, sticky='ew')
         self.sources_hide_mohidden_var = tk.BooleanVar(value=False)
         self.sources_hide_mohidden_check = ttk.Checkbutton(
             sources_search_frame,
@@ -2403,20 +2296,34 @@ class WabbajackGuideApp:
             variable=self.sources_hide_mohidden_var,
             command=self.on_sources_filter_changed,
         )
-        self.sources_hide_mohidden_check.pack(side=tk.LEFT, padx=(12, 0))
+        self.sources_hide_mohidden_check.grid(row=0, column=2, padx=(10, 0))
+        self.source_details_button = ttk.Button(sources_search_frame, text='File details…', state=tk.DISABLED,
+                                                command=lambda: self.show_file_details('sources'))
+        self.source_details_button.grid(row=0, column=3, padx=(10, 0))
+        source_footer = ttk.Frame(sources_frame)
+        source_footer.grid(row=3, column=0, sticky='ew', pady=(4, 0))
+        source_footer.columnconfigure(1, weight=1)
+        self.source_downloads_button = ttk.Button(source_footer, text='Downloads folder…', command=self.choose_source_downloads)
+        self.source_downloads_button.grid(row=0, column=0)
+        self.preferred_source_status = tk.StringVar(value='Choose downloads to verify preferred file sources.')
+        source_status = ttk.Label(source_footer, textvariable=self.preferred_source_status, wraplength=800, style='Muted.TLabel')
+        source_status.grid(row=0, column=1, sticky='ew', padx=8)
+        source_footer.bind('<Configure>', lambda event: source_status.configure(wraplength=max(180, event.width - 180)))
 
         self.sources_tree = ttk.Treeview(
             sources_frame,
-            columns=("target_path", "source_path", "size", "kind"),
+            columns=("archive_filename", "target_path", "source_path", "size", "kind"),
             show="tree headings",
         )
-        self.sources_tree.heading("#0", text="Source Archive", command=lambda: self.on_sources_sort_requested("source"))
-        self.sources_tree.heading("target_path", text="Install Path", command=lambda: self.on_sources_sort_requested("target_path"))
-        self.sources_tree.heading("source_path", text="Source Path", command=lambda: self.on_sources_sort_requested("source_path"))
+        self.sources_tree.heading("#0", text="Source (recorded title)", command=lambda: self.on_sources_sort_requested("source"))
+        self.sources_tree.heading('archive_filename', text='Archive filename', command=lambda: self.on_sources_sort_requested('archive_filename'))
+        self.sources_tree.heading("target_path", text="Install path", command=lambda: self.on_sources_sort_requested("target_path"))
+        self.sources_tree.heading("source_path", text="Source path", command=lambda: self.on_sources_sort_requested("source_path"))
         self.sources_tree.heading("size", text="Size (bytes)", command=lambda: self.on_sources_sort_requested("size"))
-        self.sources_tree.heading("kind", text="Directive", command=lambda: self.on_sources_sort_requested("kind"))
+        self.sources_tree.heading("kind", text="Directive type", command=lambda: self.on_sources_sort_requested("kind"))
 
         self.sources_tree.column("#0", width=260, minwidth=180)
+        self.sources_tree.column('archive_filename', width=320, minwidth=180)
         self.sources_tree.column("target_path", width=360, minwidth=240)
         self.sources_tree.column("source_path", width=420, minwidth=260)
         self.sources_tree.column("size", width=110, minwidth=90, anchor=tk.E)
@@ -2427,20 +2334,25 @@ class WabbajackGuideApp:
 
         self.sources_tree.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         sources_scroll.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        sources_horizontal = ttk.Scrollbar(sources_frame, orient=tk.HORIZONTAL, command=self.sources_tree.xview)
+        sources_horizontal.grid(row=2, column=0, sticky=(tk.W, tk.E))
+        self.sources_tree.configure(xscrollcommand=sources_horizontal.set)
 
         sources_frame.columnconfigure(0, weight=1)
         sources_frame.rowconfigure(1, weight=1)
         self.sources_tree.bind("<Double-1>", self.on_source_activate)
+        self.sources_tree.bind('<<TreeviewSelect>>', lambda event: self.on_file_selection('sources'))
 
         files_frame = ttk.Frame(self.notebook)
-        self.notebook.add(files_frame, text="Files")
+        self.notebook.add(files_frame, text="Output Files")
 
         files_search_frame = ttk.Frame(files_frame)
         files_search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
-        ttk.Label(files_search_frame, text="Search Files:").pack(side=tk.LEFT, padx=(0, 6))
+        files_search_frame.columnconfigure(1, weight=1)
+        ttk.Label(files_search_frame, text="Find files:").grid(row=0, column=0, padx=(0, 6))
         self.files_search_var = tk.StringVar()
         self.files_search_var.trace_add("write", self.on_files_search_changed)
-        ttk.Entry(files_search_frame, textvariable=self.files_search_var, width=48).pack(side=tk.LEFT)
+        ttk.Entry(files_search_frame, textvariable=self.files_search_var, width=20).grid(row=0, column=1, sticky='ew')
         self.files_hide_mohidden_var = tk.BooleanVar(value=False)
         self.files_hide_mohidden_check = ttk.Checkbutton(
             files_search_frame,
@@ -2448,24 +2360,39 @@ class WabbajackGuideApp:
             variable=self.files_hide_mohidden_var,
             command=self.on_files_filter_changed,
         )
-        self.files_hide_mohidden_check.pack(side=tk.LEFT, padx=(12, 0))
+        self.files_hide_mohidden_check.grid(row=0, column=2, padx=(10, 0))
+        self.file_details_button = ttk.Button(files_search_frame, text='File details…', state=tk.DISABLED,
+                                              command=lambda: self.show_file_details('files'))
+        self.file_details_button.grid(row=0, column=3, padx=(10, 0))
+        output_help = ttk.Label(files_frame, text='Expected package output, arranged by destination. Double-click a file for installation details.', style='Muted.TLabel')
+        output_help.grid(row=3, column=0, sticky='ew', pady=(4, 0))
+        files_frame.bind('<Configure>', lambda event: output_help.configure(wraplength=max(200, event.width - 20)))
 
-        self.files_tree = ttk.Treeview(files_frame, columns=("source_mod", "source_path", "size"), show="tree headings")
-        self.files_tree.heading("#0", text="Target Path", command=lambda: self.on_files_sort_requested("target_path"))
-        self.files_tree.heading("source_mod", text="Source Mod", command=lambda: self.on_files_sort_requested("source_mod"))
-        self.files_tree.heading("source_path", text="Source Path", command=lambda: self.on_files_sort_requested("source_path"))
+        self.files_tree = ttk.Treeview(files_frame, columns=("source_mod", "source_path", "size", "kind", "hash"), show="tree headings")
+        self.files_tree.heading("#0", text="Output path", command=lambda: self.on_files_sort_requested("target_path"))
+        self.files_tree.heading("source_mod", text="Source archive", command=lambda: self.on_files_sort_requested("source_mod"))
+        self.files_tree.heading("source_path", text="Source path", command=lambda: self.on_files_sort_requested("source_path"))
         self.files_tree.heading("size", text="Size (bytes)", command=lambda: self.on_files_sort_requested("size"))
+        self.files_tree.heading("kind", text="Directive type")
+        self.files_tree.heading("hash", text="Recorded output hash")
 
         self.files_tree.column("#0", width=300, minwidth=200)
         self.files_tree.column("source_mod", width=210, minwidth=140)
         self.files_tree.column("source_path", width=300, minwidth=200)
         self.files_tree.column("size", width=100, minwidth=80)
+        self.files_tree.column("kind", width=150, minwidth=110)
+        self.files_tree.column("hash", width=160, minwidth=130)
 
         files_scroll = ttk.Scrollbar(files_frame, orient=tk.VERTICAL, command=self.files_tree.yview)
         self.files_tree.configure(yscrollcommand=files_scroll.set)
 
         self.files_tree.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         files_scroll.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        files_horizontal = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL, command=self.files_tree.xview)
+        files_horizontal.grid(row=2, column=0, sticky=(tk.W, tk.E))
+        self.files_tree.configure(xscrollcommand=files_horizontal.set)
+        self.files_tree.bind('<<TreeviewSelect>>', lambda event: self.on_file_selection('files'))
+        self.files_tree.bind('<Double-1>', self.on_output_file_activate)
 
         self.add_tooltip(self.sources_hide_mohidden_check, "Hide source file entries whose path ends with .mohidden.")
         self.add_tooltip(self.files_hide_mohidden_check, "Hide file entries whose path ends with .mohidden.")
@@ -2473,111 +2400,136 @@ class WabbajackGuideApp:
         files_frame.columnconfigure(0, weight=1)
         files_frame.rowconfigure(1, weight=1)
 
-        paned_window.add(mod_frame, weight=2)
+        paned_window.add(mod_frame, weight=1)
         paned_window.add(details_frame, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_mod_select)
+        self.tree.bind('<Configure>', lambda event: self.tree.see(self.tree.selection()[0]) if self.tree.selection() else None)
         self.tree.bind("<Button-3>", self.on_mod_right_click)
         self.tree.bind("<Control-c>", self.copy_tree_selection)
         self.tree.bind("<Control-C>", self.copy_tree_selection)
+        from table_columns import TableColumns
+        self.mod_columns = TableColumns(self.tree, self.column_widths, self.persist_preferences)
+        self.source_columns = TableColumns(self.sources_tree, self.column_widths, self.persist_preferences, cap=520)
+        self.file_columns = TableColumns(self.files_tree, self.column_widths, self.persist_preferences, cap=520)
+        self.source_columns.configure('sources')
+        self.file_columns.configure('files')
 
         self.populate_mod_list()
         self.update_sort_indicators()
 
         status_frame = ttk.Frame(main_frame)
+        self.status_frame = status_frame
         status_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
 
         self.status_var = tk.StringVar()
-        self.status_var.set("No modlist loaded")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
+        self.status_var.set("No Wabbajack open")
+        status_label = ttk.Label(status_frame, textvariable=self.status_var, style='Muted.TLabel', wraplength=1100)
+        status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        status_frame.bind('<Configure>', lambda event: status_label.configure(wraplength=max(200, event.width - 20)))
+        from comparison_ui import InstalledComparisonControls
+        self.comparison_view = InstalledComparisonControls(self.mods_toolbar, self.set_installed_report,
+            can_start=lambda: not self._closing and not getattr(self, 'loading_package', False) and not (self.workbench_view and self.workbench_view.busy))
+        self.comparison_view.window.grid(row=0, column=1, sticky='ne')
+        self.mods_toolbar.bind('<Configure>', self.layout_mods_toolbar)
+        self.search_frame.bind('<Configure>', self.layout_mods_toolbar)
+        self.layout_mods_toolbar()
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ttk.Label(status_frame, text=f"Generated: {timestamp}").pack(side=tk.RIGHT)
+        self._mods_pane_height = None
+        def set_sash_position(event=None):
+            if self.details_hidden:
+                return
+            height = paned_window.winfo_height()
+            if height > 100 and (height != self._mods_pane_height or (event and event.widget is self.notebook)):
+                self._mods_pane_height = height
+                tab = self.notebook.tab(self.notebook.select(), 'text')
+                reserve = 260 if tab in ('Install Instructions', 'Output Files') else 180
+                position = max(min(145, height // 3), min(int(height * self.details_split), height - reserve))
+                paned_window.sashpos(0, position)
+        self._position_details = set_sash_position
+        paned_window.bind('<Configure>', set_sash_position)
+        self.notebook.bind('<<NotebookTabChanged>>', set_sash_position)
+        def remember_sash(event):
+            if not self.details_hidden and paned_window.winfo_height() > 100:
+                self.details_split = min(.75, max(.2, paned_window.sashpos(0) / paned_window.winfo_height()))
+                self.persist_preferences()
+        paned_window.bind('<ButtonRelease-1>', remember_sash)
+        if self.details_hidden:
+            paned_window.forget(details_frame)
+            self.show_details_button.grid()
+        self.root.bind('<Destroy>', self.on_root_destroy, add='+')
 
-        def set_sash_position():
-            try:
-                paned_window.sashpos(0, 420)
-            except Exception:
-                pass
-
-        self.root.after(100, set_sash_position)
+    def toggle_details(self):
+        """Collapse details without losing the selection, tab or divider preference."""
+        self.details_hidden = not self.details_hidden
+        if self.details_hidden:
+            self.mod_details_panes.forget(self.details_frame)
+        else:
+            self.mod_details_panes.add(self.details_frame, weight=1)
+            self.mod_details_panes.update_idletasks()
+            self._mods_pane_height = None
+            self._position_details()
+        if self.details_hidden:
+            self.show_details_button.grid()
+        else:
+            self.show_details_button.grid_remove()
+        self.persist_preferences()
 
     def on_header_button_frame_configure(self, event=None):
         """Reflow toolbar buttons whenever header width changes."""
         self.layout_header_buttons()
 
     def layout_header_buttons(self):
-        """Wrap toolbar widgets to new rows when the window is narrow."""
+        """Keep the package profile below its title and Open at the right."""
         if not hasattr(self, "header_toolbar_widgets") or not hasattr(self, "header_button_frame"):
             return
 
-        frame = self.header_button_frame
-        frame.update_idletasks()
-        available_width = max(320, int(frame.winfo_width() or frame.winfo_reqwidth() or 320))
-
-        for widget, _pad in self.header_toolbar_widgets:
-            widget.grid_forget()
-
-        row_index = 0
-        col_index = 0
-        used_width = 0
-        row_height = 0
-        row_spacing = 4
-
-        for widget, pad in self.header_toolbar_widgets:
-            pad_left, pad_right = pad
-            widget_width = int(widget.winfo_reqwidth()) + pad_left + pad_right
-            widget_height = int(widget.winfo_reqheight())
-
-            if col_index > 0 and used_width + widget_width > available_width:
-                row_index += 1
-                col_index = 0
-                used_width = 0
-                row_height = 0
-
-            widget.grid(row=row_index, column=col_index, padx=pad, pady=(0, row_spacing), sticky=tk.W)
-            used_width += widget_width
-            row_height = max(row_height, widget_height)
-            col_index += 1
-
-    def has_active_compare_colors(self):
-        """Return True when any row currently has a compare color status."""
-        return any(row.get("compare_status") in {"green", "yellow", "red"} for row in self.mod_rows) or bool(self.external_only_compare_names)
-
-    def has_external_only_rows(self):
-        """Return True when compare has unmatched external entries."""
-        return bool(self.external_only_compare_names)
-
-    def on_toggle_show_external_only(self):
-        """Re-render list when the external-only visibility toggle changes."""
-        if self.show_external_only_var.get() and self.has_external_only_rows():
-            if self.sort_state_before_external_only is None:
-                self.sort_state_before_external_only = (self.sort_column, self.sort_reverse)
-            self.sort_column = "number"
-            self.sort_reverse = False
-            self.set_status("Sorting is locked while Show External-Only is enabled (showing compare placement order).")
+        self.open_button.grid(row=0, column=0, sticky='e')
+        self.profile_label.grid(row=0, column=0, sticky='w', padx=(0, 6))
+        if len(self.profile_combobox['values']) > 1 and not self.loaded_from_saved_modlist:
+            self.profile_combobox.grid(row=0, column=1, sticky='w')
         else:
-            if self.sort_state_before_external_only is not None:
-                self.sort_column, self.sort_reverse = self.sort_state_before_external_only
-                self.sort_state_before_external_only = None
-        self.apply_filters_and_sort()
+            self.profile_combobox.grid_remove()
+        if self.modlist_data:
+            self.profile_frame.grid()
+        else:
+            self.profile_frame.grid_remove()
 
-    def is_external_only_sort_locked(self):
-        """Return True when sort changes should be blocked to preserve compare placement."""
-        return bool(
-            getattr(self, "show_external_only_var", None)
-            and self.show_external_only_var.get()
-            and self.has_external_only_rows()
-        )
+    def layout_mods_toolbar(self, event=None):
+        if not self.comparison_view:
+            return
+        width = self.mods_toolbar.winfo_width()
+        # Filters get their own line before the search field becomes cramped.
+        narrow = width < 1100
+        self.comparison_filter_box.grid_configure(row=1 if narrow else 0, column=1 if narrow else 3,
+                                                  sticky='w', pady=(4, 0) if narrow else 0)
+        if not self.installed_report:
+            self.comparison_filter_box.grid_remove()
+        needed = self.search_frame.winfo_reqwidth() + self.comparison_view.window.winfo_reqwidth() + 24
+        self.comparison_view.window.grid_configure(row=1 if width < needed else 0,
+                                                   column=0 if width < needed else 1,
+                                                   sticky='ew' if width < needed else 'ne',
+                                                   pady=(6, 0) if width < needed else 0)
 
     def update_legend_visibility(self):
-        """Show legend only when compare colors are active."""
+        """Show the installed comparison legend while results are displayed."""
         if not hasattr(self, "legend_frame"):
             return
-        if self.has_active_compare_colors():
-            self.legend_frame.grid()
-        else:
+        for child in self.legend_frame.winfo_children():
+            child.destroy()
+        if not self.installed_report:
             self.legend_frame.grid_remove()
+            return
+        from collections import Counter
+        from comparison_presenter import category
+        counts = Counter(category(row) for row in self.installed_report['rows'])
+        labels = [(f'Matches: {counts["Matches"]:,}', COLORS['green']),
+                  (f'Differs / needs review: {counts["Different"] + counts["Needs review"]:,}', COLORS['amber']),
+                  (f'Wabbajack only: {counts["Wabbajack only"]:,}', COLORS['red']),
+                  (f'Installed only: {counts["Installed only"]:,}', COLORS['blue'])]
+        for index, (label, color) in enumerate(labels):
+            ttk.Label(self.legend_frame, text='● ' + label, foreground=color).grid(row=0, column=index, sticky='w', padx=(0, 12))
+        self.legend_frame.grid()
 
     def refresh_profile_selector(self):
         """Populate and enable/disable the profile combobox."""
@@ -2585,10 +2537,14 @@ class WabbajackGuideApp:
             return
         profiles = getattr(self, "all_profile_paths", [])
         profile_names = [p.rsplit("\\", 1)[0].split("\\")[-1] for p in profiles]
-        if len(profile_names) > 1:
+        model = getattr(self, 'package_model', None)
+        if model:
+            profile_names = [model.profiles.get(name.casefold(), name) for name in profile_names]
+        if len(profile_names) > 1 and not self.loaded_from_saved_modlist:
+            self.profile_label.configure(text='Wabbajack profile:')
             self.profile_combobox["values"] = profile_names
             self.profile_combobox.config(state="readonly")
-            current = self.active_profile.split("\\")[-1] if self.active_profile else ""
+            current = self.selected_profile_name()
             if current in profile_names:
                 self.profile_var.set(current)
             else:
@@ -2597,32 +2553,195 @@ class WabbajackGuideApp:
             self.profile_combobox["values"] = profile_names
             self.profile_combobox.config(state=tk.DISABLED)
             if profile_names:
-                self.profile_var.set(profile_names[0])
-
-    def refresh_ini_buttons(self):
-        """Enable/disable ini viewer buttons based on loaded profile files."""
-        for ini_name, button in self.ini_buttons.items():
-            if ini_name in self.profile_ini_files:
-                button.config(state=tk.NORMAL)
+                self.profile_var.set(self.selected_profile_name() or profile_names[0])
+                self.profile_label.configure(text='Wabbajack profile: ' + self.profile_var.get())
             else:
-                button.config(state=tk.DISABLED)
+                self.profile_var.set("")
+                self.profile_label.configure(text='No Wabbajack profile' if self.modlist_data else 'Wabbajack profile:')
+        self.layout_header_buttons()
 
-    def open_ini_viewer(self, ini_name):
-        """Open a read-only window with the selected ini file contents."""
-        content = self.profile_ini_files.get(ini_name)
-        if content is None:
-            messagebox.showwarning("INI Not Found", f"{ini_name} was not found in InlineFile profile data.")
+    def selected_profile_name(self):
+        name = self.active_profile.split('\\')[-1] if self.active_profile else ''
+        model = getattr(self, 'package_model', None)
+        return model.profiles.get(name.casefold(), name) if model else name
+
+    def setup_menus(self):
+        self.menu_bar = ttk.Frame(self.root)
+        self.menu_bar.grid(row=0, column=0, sticky='ew', padx=10, pady=(4, 0))
+        self.menu_buttons = []
+
+        def dropdown(label):
+            button = ttk.Menubutton(self.menu_bar, text=label, width=0,
+                                    style='Menu.TMenubutton', direction='below')
+            popup = tk.Menu(button, tearoff=False, background=COLORS['surface'], foreground=COLORS['text'],
+                            activebackground=COLORS['selection'], activeforeground=COLORS['text'],
+                            disabledforeground='#818b99', selectcolor=COLORS['accent'],
+                            relief='solid', borderwidth=1, activeborderwidth=0, font='TkDefaultFont')
+            button.configure(menu=popup)
+            button.pack(side=tk.LEFT, padx=(0, 4))
+            self.menu_buttons.append(button)
+            return popup
+
+        self.export_menu = dropdown('Export')
+        self.export_menu.add_command(label='Mod order (modlist.txt)…', command=self.export_modlist_txt, state=tk.DISABLED)
+        self.export_menu.add_command(label='Separator folders…', command=self.export_separators_zip, state=tk.DISABLED)
+        self.saved_views_menu = dropdown('Snapshots')
+        self.saved_views_menu.add_command(label='Open snapshot…', command=self.load_saved_modlist)
+        self.saved_views_menu.add_command(label='Save snapshot…', command=self.save_modlist, state=tk.DISABLED)
+        self.saved_views_menu.add_checkbutton(label='Restore last session on startup', variable=self.restore_session_var,
+                                             command=self.persist_preferences)
+        self.saved_views_menu.add_command(label='Recheck archive sources', command=self.start_preferred_source_checks)
+        help_menu = dropdown('Help')
+        help_menu.add_command(label='How to use', command=lambda: messagebox.showinfo('Wabbajack Viewer',
+            '1. Open a Wabbajack and choose its profile.\n'
+            '2. In Mods, choose an installed profile, then Compare. Settings… lets you choose its profiles folder and optional content checks.\n'
+            '3. Select a row for Comparison evidence, Overview, Install Instructions or Output Files.\n'
+            '4. Profile file differences… shows mod order, plugin and INI text differences.\n\n'
+            'Comparison, file-content checks, profile-file differences and reports support both Amethyst and Mod Organizer 2 (MO2). '
+            'For MO2, select its profiles folder manually. Use Choose mods folder… if automatic detection fails, '
+            'including for custom profile locations or Windows paths accessed from Linux.\n\n'
+            'Column widths are remembered. Right-click a heading to fit columns to their contents.\n\n'
+            'The Activity panel shows progress, elapsed time and Cancel while opening or checking sources. Snapshot saving also runs in the background.\n\n'
+            'Create profile copy supports Amethyst only and currently requires Linux; MO2 profile copying is not supported. '
+            'A separate root folder is copied only when the source uses one. Shared games stay shared.\n'
+            'Snapshots save the parsed mod list and verified source choices. The last session is saved automatically. '
+            'Restore last session on startup can be turned off in Snapshots. '
+            'Comparison resumes when the original Wabbajack is present and unchanged.'))
+        self.root.bind('<Control-o>', lambda event: self.load_wabbajack_file())
+
+    def sync_workflow(self):
+        model = getattr(self, 'package_model', None)
+        if self.loaded_from_saved_modlist:
+            model = None
+        selected = self.selected_profile_name()
+        identity = (id(model), selected)
+        changed = identity != getattr(self, '_workspace_context', None)
+        self._workspace_context = identity
+        if changed:
+            self.comparison_view.set_package_context(model, selected)
+        name = self.modlist_data.get('Name', '') if self.modlist_data else ''
+        version = self.modlist_data.get('Version', '') if self.modlist_data else ''
+        self.title_label.configure(text=f'{name} {version}'.strip() or 'Wabbajack Viewer')
+        self.open_button.configure(style='TButton' if self.modlist_data else 'Accent.TButton')
+        if self.loaded_from_saved_modlist:
+            self.source_var.set(f"Mod list snapshot: {self.modlist_data.get('Name', 'Unknown')} · {selected or 'No profile'}\n{getattr(self, 'snapshot_restore_reason', '')} Open the original Wabbajack to compare installed mods.")
+        elif model:
+            self.source_var.set('')
+            if not selected:
+                self.source_var.set('No mod profile is included. Showing the download inventory.')
+        else:
+            self.source_var.set('No Wabbajack open.')
+        if self.source_var.get():
+            self.source_label.grid()
+        else:
+            self.source_label.grid_remove()
+        self.source_tooltip.hide()
+        self.source_tooltip.text = str(model.path) if model else getattr(self, 'loaded_snapshot_path', '') if self.loaded_from_saved_modlist else ''
+        has_rows = bool(self.mod_rows)
+        self.workspace.tab(0, text='Mods' if selected or not model else 'Downloads')
+        self.export_menu.entryconfigure(0, state=tk.NORMAL if has_rows and selected else tk.DISABLED)
+        self.export_menu.entryconfigure(1, state=tk.NORMAL if self.get_separator_folder_names() else tk.DISABLED)
+        self.saved_views_menu.entryconfigure(1, state=tk.NORMAL if has_rows and selected else tk.DISABLED)
+        self.update_legend_visibility()
+        self.on_workspace_selected()
+
+    def on_workspace_selected(self, event=None):
+        if self._initial_load:
+            self.status_frame.grid_remove()
             return
+        if hasattr(self, 'status_frame'):
+            self.status_frame.grid_remove() if self.workspace.select() == str(self.workbench_page) else self.status_frame.grid()
+        if self.workspace.select() == str(self.workbench_page) and self.workbench_view is None:
+            from profile_copy_ui import ProfileCopyView
+            self.workbench_view = ProfileCopyView(self.workbench_page,
+                folder=self.comparison_view.folder.get(), selected=self.comparison_view.selected_profile.get(),
+                busy_changed=self.set_workbench_busy, can_start=lambda: not self._closing and not getattr(self, 'loading_package', False) and not self.comparison_view.running,
+                copied=self.comparison_view.refresh_profiles)
+            self.workbench_view.window.pack(fill=tk.BOTH, expand=True)
 
-        window = tk.Toplevel(self.root)
-        profile_name = self.active_profile.split("\\")[-1] if self.active_profile else "Unknown"
-        window.title(f"{ini_name} - {profile_name}")
-        window.geometry("900x700")
+    def set_installed_report(self, report):
+        self.installed_report = report
+        if not hasattr(self, 'tree'):
+            return
+        self.clear_mod_details()
+        if report:
+            self.notebook.insert(0, self.comparison_detail_frame, text='Comparison')
+            self.notebook.select(self.comparison_detail_frame)
+            self.sort_column, self.sort_reverse = 'number', False
+            self.comparison_filter_box.grid()
+        else:
+            if str(self.comparison_detail_frame) in self.notebook.tabs():
+                self.notebook.hide(self.comparison_detail_frame)
+            self.comparison_filter_box.grid_remove()
+            self.comparison_filter.set('All mods')
+        self.update_sort_indicators()
+        self.configure_mod_columns()
+        self.apply_filters_and_sort()
+        self.update_legend_visibility()
+        first = next((item for item, row in self.row_by_item_id.items() if not row.get('is_separator')), None)
+        if first:
+            self.tree.selection_set(first)
+            self.on_mod_select(None)
 
-        text = scrolledtext.ScrolledText(window, wrap=tk.NONE)
-        text.pack(fill=tk.BOTH, expand=True)
-        text.insert(1.0, content)
-        text.config(state=tk.DISABLED)
+    def configure_mod_columns(self):
+        from comparison_presenter import display_rows, result_label
+        from profile_compare import enabled_label
+        report = self.installed_report
+        rows = display_rows(self.mod_rows, report) if report else self.mod_rows
+        data = []
+        for row in rows:
+            comparison = row.get('comparison') or {}
+            data.append({'#0': row.get('number', ''), 'active': self.get_activation_mark_for_row(row),
+                'name': '' if row.get('installed_only') else row['name'], 'sources': self.archive_count(row),
+                'author': row.get('author', ''), 'version': comparison.get('package_version', row.get('version', '')),
+                'size': self.preferred_row(row).get('size_mb', ''), 'result': result_label(comparison) if comparison else '',
+                'local_name': comparison.get('local_name', ''), 'local_version': comparison.get('local_version', ''),
+                'local_order': comparison.get('local_order') or '', 'local_active': enabled_label(comparison.get('local_enabled'))})
+        self.mod_columns.configure('comparison' if report else 'mods',
+            ('local_order', 'result', 'name', 'local_name', 'version', 'local_version', 'active', 'local_active') if report
+            else ('active', 'name', 'sources', 'author', 'version', 'size'), data)
+
+    def set_workbench_busy(self, busy):
+        if busy:
+            self.comparison_view.set_blocked(True)
+            self._workbench_widget_states = []
+            for widget, _ in self.header_toolbar_widgets:
+                try:
+                    self._workbench_widget_states.append((widget, widget.cget('state')))
+                    widget.configure(state=tk.DISABLED)
+                except tk.TclError:
+                    pass
+            self._workbench_menu_states = []
+            for menu in (self.saved_views_menu, self.export_menu):
+                for index in range(menu.index('end') + 1):
+                    self._workbench_menu_states.append((menu, index, menu.entrycget(index, 'state')))
+                    menu.entryconfigure(index, state=tk.DISABLED)
+        else:
+            for widget, state in self._workbench_widget_states:
+                widget.configure(state=state)
+            for menu, index, state in self._workbench_menu_states:
+                menu.entryconfigure(index, state=state)
+            self.sync_workflow()
+            self.comparison_view.set_blocked(False)
+
+    def request_close(self):
+        if self.workbench_view and self.workbench_view.busy:
+            messagebox.showwarning('Profile copy in progress',
+                'Wait for profile preview or copying to finish before closing.', parent=self.root)
+            return
+        if self._closing:
+            return
+        self._closing = True
+        self.comparison_view.set_blocked(True)
+        self.cancel_preferred_source_checks()
+        if hasattr(self, 'load_cancel'):
+            self.load_cancel.set()
+        self.autosave_session()
+        if self._save_thread is None:
+            self.root.destroy()
+        else:
+            self.activity.start('save', 'Saving session before closing')
+            self.set_status('The window will close when the session has finished saving…')
 
     def populate_mod_list(self):
         """Populate the treeview with current filtered/sorted rows."""
@@ -2633,91 +2752,23 @@ class WabbajackGuideApp:
         search_text = self.search_var.get().lower().strip()
 
         rows = list(self.mod_rows)
-        showing_external_only = bool(
-            getattr(self, "show_external_only_var", None)
-            and self.show_external_only_var.get()
-            and self.external_only_compare_names
-        )
-        if showing_external_only and (self.sort_column != "number" or self.sort_reverse):
-            self.sort_column = "number"
-            self.sort_reverse = False
-        external_render_order = {}
-        if showing_external_only:
-            inserts_by_index = {}
-            for entry in self.external_only_compare_names:
-                insert_index = int(entry.get("insert_index", len(self.mod_rows)))
-                inserts_by_index.setdefault(insert_index, []).append(entry)
-
-            interleaved_rows = []
-            wb_index = 0
-            external_counter = 0
-            for row in self.mod_rows:
-                if not row.get("is_separator"):
-                    pending_entries = inserts_by_index.get(wb_index, [])
-                    for entry in pending_entries:
-                        external_counter += 1
-                        name = str(entry.get("name", ""))
-                        display_name, is_separator = self.parse_external_entry_name(name)
-                        interleaved_rows.append(
-                            {
-                                "number": f"E{external_counter}",
-                                "name": display_name,
-                                "raw_name": name,
-                                "folder_key": self.normalize_mod_key(name),
-                                "active": False,
-                                "is_separator": is_separator,
-                                "author": "-",
-                                "version": "",
-                                "size_mb": "",
-                                "direct_link_count": 0,
-                                "archive_hash": "",
-                                "archive_name": "",
-                                "archive": None,
-                                "folder_meta": {},
-                                "source_archives": [],
-                                "folder_files": [],
-                                "source_file_counts": {},
-                                "compare_status": "external_only",
-                                "external_only": True,
-                            }
-                        )
-                    wb_index += 1
-
-                interleaved_rows.append(row)
-
-            for entry in inserts_by_index.get(wb_index, []):
-                external_counter += 1
-                name = str(entry.get("name", ""))
-                display_name, is_separator = self.parse_external_entry_name(name)
-                interleaved_rows.append(
-                    {
-                        "number": f"E{external_counter}",
-                        "name": display_name,
-                        "raw_name": name,
-                        "folder_key": self.normalize_mod_key(name),
-                        "active": False,
-                        "is_separator": is_separator,
-                        "author": "-",
-                        "version": "",
-                        "size_mb": "",
-                        "direct_link_count": 0,
-                        "archive_hash": "",
-                        "archive_name": "",
-                        "archive": None,
-                        "folder_meta": {},
-                        "source_archives": [],
-                        "folder_files": [],
-                        "source_file_counts": {},
-                        "compare_status": "external_only",
-                        "external_only": True,
-                    }
-                )
-
-            for index, row in enumerate(interleaved_rows):
-                external_render_order[id(row)] = index
-            rows = interleaved_rows
+        report = getattr(self, 'installed_report', None)
+        if report:
+            from comparison_presenter import display_rows
+            rows = display_rows(rows, report)
 
         def row_matches_search(row):
+            comparison = row.get('comparison')
+            if report:
+                from comparison_presenter import matches_filter
+                selected_filter = self.comparison_filter.get()
+                if row.get('is_separator'):
+                    if selected_filter != 'All mods':
+                        return False
+                elif not matches_filter(comparison, selected_filter):
+                    return False
+                if comparison and search_text:
+                    return search_text in json.dumps(comparison, ensure_ascii=False).casefold()
             if not search_text:
                 return True
             return (
@@ -2727,15 +2778,16 @@ class WabbajackGuideApp:
             )
 
         def sort_key(item):
+            comparison = item.get('comparison') or {}
+            if self.sort_column == 'result':
+                from comparison_presenter import result_label
+                return result_label(comparison) if comparison else ''
+            if self.sort_column in ('local_name', 'local_version', 'local_order', 'local_active'):
+                field = 'local_enabled' if self.sort_column == 'local_active' else self.sort_column
+                value = comparison.get(field)
+                return (value or 0) if field in ('local_order', 'local_enabled') else str(value or '').casefold()
             if self.sort_column == "number":
-                if showing_external_only:
-                    return external_render_order.get(id(item), 0)
                 number = item.get("number", 0)
-                if isinstance(number, str) and number.startswith("E"):
-                    try:
-                        return (1, int(number[1:]))
-                    except Exception:
-                        return (1, 0)
                 try:
                     return (0, int(number))
                 except Exception:
@@ -2750,19 +2802,19 @@ class WabbajackGuideApp:
             if self.sort_column == "name":
                 return str(item.get("name", "")).lower()
             if self.sort_column == "sources":
-                return len(item.get("source_archives", []))
+                return self.archive_count(item)
             if self.sort_column == "author":
                 return str(item.get("author", "")).lower()
             if self.sort_column == "version":
                 return str(item.get("version", "")).lower()
             if self.sort_column == "size":
                 try:
-                    return float(item.get("size_mb") or 0)
+                    return float(self.preferred_row(item).get("size_mb") or 0)
                 except Exception:
                     return 0.0
             return item.get("number", 0)
 
-        if self.sort_column == "number" or showing_external_only:
+        if self.sort_column == "number":
             sections = []
             current_header = None
             current_children = []
@@ -2800,14 +2852,26 @@ class WabbajackGuideApp:
 
         self.tree.delete(*self.tree.get_children())
         self.row_by_item_id = {}
+        self.clear_mod_details()
+
+        def values_for(row):
+            from comparison_presenter import result_label
+            from profile_compare import enabled_label
+            comparison = row.get('comparison')
+            active = '—' if row.get('installed_only') else self.get_activation_mark_for_row(row)
+            name = '' if row.get('installed_only') else row['name']
+            return (active, name, self.archive_count_label(row), row['author'],
+                    comparison['package_version'] if comparison else row['version'], self.preferred_row(row).get('size_mb', ''), result_label(comparison) if comparison else '',
+                    comparison['local_name'] if comparison else '', comparison['local_version'] if comparison else '',
+                    comparison.get('local_order') or '' if comparison else '',
+                    enabled_label(comparison['local_enabled']) if comparison else '')
 
         visible_count = 0
         for header, children in sections:
             if header is None:
                 parent_id = ""
             else:
-                active_mark = self.get_activation_mark_for_row(header)
-                values = (active_mark, header["name"], "", header["author"], header["version"], header["size_mb"])
+                values = values_for(header)
                 tags = ["separator"]
                 compare_status = header.get("compare_status")
                 if compare_status == "green":
@@ -2825,9 +2889,7 @@ class WabbajackGuideApp:
                 visible_count += 1
 
             for row in children:
-                active_mark = self.get_activation_mark_for_row(row)
-                sources_value = "" if row["is_separator"] else str(len(row.get("source_archives", [])))
-                values = (active_mark, row["name"], sources_value, row["author"], row["version"], row["size_mb"])
+                values = values_for(row)
                 tags = ["separator"] if row["is_separator"] else []
 
                 compare_status = row.get("compare_status")
@@ -2847,10 +2909,15 @@ class WabbajackGuideApp:
                 self.row_by_item_id[item_id] = row
                 visible_count += 1
 
-        total_count = len(self.mod_rows) + (len(self.external_only_compare_names) if showing_external_only else 0)
+        total_count = len(rows)
+        self.list_count_var.set(f'{total_count:,} mods' if visible_count == total_count else f'{visible_count:,} of {total_count:,} mods')
+        if self.search_var.get():
+            self.clear_search_button.grid()
+        else:
+            self.clear_search_button.grid_remove()
         if hasattr(self, "status_var"):
             if self.active_profile:
-                profile_name = self.active_profile.split("\\")[-1]
+                profile_name = self.selected_profile_name()
                 self.status_var.set(f"Profile '{profile_name}': showing {visible_count} of {total_count} entries")
             else:
                 self.status_var.set(f"Showing {visible_count} of {total_count} entries")
@@ -2859,9 +2926,6 @@ class WabbajackGuideApp:
 
     def sort_by(self, column):
         """Sort list by number or name."""
-        if self.is_external_only_sort_locked():
-            self.set_status("Sorting is disabled while Show External-Only is enabled.")
-            return
         if column == self.sort_column:
             self.sort_reverse = not self.sort_reverse
         else:
@@ -2893,19 +2957,328 @@ class WabbajackGuideApp:
         if self.current_selected_row:
             self.update_files_tab(self.current_selected_row)
 
+    def raw_directive_for_file(self, file_info):
+        key = str(file_info.get('target_path', '')).replace('\\', '/').casefold()
+        model = getattr(self, 'package_model', None)
+        if model:
+            return model.destinations.get(key)
+        manifest = getattr(self, 'modlist_data', None) or {}
+        if getattr(self, '_detail_manifest', None) is not manifest:
+            self._detail_manifest = manifest
+            self._detail_directives = {
+                str(item.get('To', '')).replace('\\', '/').casefold(): item
+                for item in manifest.get('Directives', []) if isinstance(item, dict)}
+        return self._detail_directives.get(key)
+
+    def preferred_key(self, row):
+        return (id(row.get('folder_files')), getattr(self, 'downloads_folder', ''))
+
+    def preferred_row(self, row):
+        result = getattr(self, '_preferred_cache', {}).get(self.preferred_key(row))
+        return presentation_row(row, result)
+
+    def archive_count_label(self, row):
+        if row.get('is_separator'):
+            return ''
+        if self.preferred_key(row) in self._preferred_pending:
+            return '…'
+        return str(self.archive_count(row))
+
+    def archive_count(self, row):
+        return sum(not str(archive.get('Hash', '')).startswith(self.INLINE_SOURCE_PREFIX)
+                   for archive in self.preferred_row(row).get('source_archives', []))
+
+    def choose_source_downloads(self):
+        folder = filedialog.askdirectory(title='Downloads containing the mod archives',
+                                         initialdir=self.downloads_folder or str(Path.home() / 'Downloads'))
+        if folder:
+            self.downloads_folder = folder
+            self.persist_preferences()
+            self.start_preferred_source_checks()
+            if self.current_selected_row:
+                self.on_mod_select(None)
+
+    def verify_sources_before_display(self):
+        """Finish source decisions before publishing the staged package's rows."""
+        self._preferred_batch_keys = set()
+        if not self.downloads_folder:
+            return
+        rows = [row for row in self.mod_rows if preferred_source_candidates(row, self.archives)]
+        inspections = {}
+        for index, row in enumerate(rows, 1):
+            key = self.preferred_key(row)
+            self._preferred_batch_keys.add(key)
+            def progress(message):
+                self.set_status(f'Verifying archive sources: {index}/{len(rows)} — {row["raw_name"]}')
+            progress('')
+            cached = self._preferred_cache.get(key)
+            if cached and signature(cached['path']) == cached['signature']:
+                continue
+            result = verify_preferred_sources(row, self.downloads_folder, self.archives,
+                                              progress=progress, inspections=inspections)
+            result['_files'] = row['folder_files']
+            self._preferred_cache[key] = result
+
+    def start_preferred_source_checks(self, force=True):
+        """Check the entire authored list, including rows hidden by current filters."""
+        if self._closing or getattr(self, 'loading_package', False) or (self.workbench_view and self.workbench_view.busy):
+            return
+        self._preferred_generation += 1
+        self._preferred_pending.clear()
+        self._preferred_batch_keys = set()
+        while True:
+            try:
+                self._preferred_tasks.get_nowait()
+            except queue.Empty:
+                break
+        if not self.downloads_folder:
+            return
+        for row in self.mod_rows:
+            if preferred_source_candidates(row, self.archives):
+                self._preferred_batch_keys.add(self.preferred_key(row))
+                self.request_preferred_source_check(row, update_status=False, force=force)
+        for item, row in self.row_by_item_id.items():
+            self.tree.set(item, 'sources', self.archive_count_label(row))
+        self.update_preferred_source_progress()
+
+    def cancel_preferred_source_checks(self):
+        self._preferred_generation += 1
+        self._preferred_pending.clear()
+        self._preferred_batch_keys.clear()
+        for item, row in self.row_by_item_id.items():
+            self.tree.set(item, 'sources', self.archive_count_label(row))
+        self.activity.finish('sources')
+        self.preferred_source_status.set('Source checks cancelled. Completed results are retained.')
+        self.set_status('Archive source checks cancelled.')
+
+    def update_preferred_source_progress(self):
+        total = len(self._preferred_batch_keys)
+        if total:
+            remaining = len(self._preferred_batch_keys & self._preferred_pending)
+            self.set_status(f'Checking archive sources: {total - remaining}/{total} mods' if remaining
+                            else f'Archive source checks complete: {total} mods checked')
+        if not self._preferred_pending:
+            self.activity.finish('sources')
+
+    def preferred_source_worker(self):
+        """One worker bounds archive I/O even when the package contains many mods."""
+        while not self._preferred_stop.is_set():
+            try:
+                generation, key, row, folder, archives = self._preferred_tasks.get(timeout=.2)
+            except queue.Empty:
+                continue
+            if generation != self._preferred_generation:
+                continue
+            try:
+                def progress(message):
+                    if self._preferred_stop.is_set() or generation != self._preferred_generation:
+                        raise SourceVerificationCancelled('Source verification cancelled.')
+                checked = verify_preferred_sources(row, folder, archives, progress=progress)
+            except Exception as error:
+                checked = {'alternatives': {}, 'path': '', 'signature': signature(''), 'message': str(error)}
+            checked['_files'] = row['folder_files']
+            self._preferred_events.put((generation, key, checked))
+
+    def request_preferred_source_check(self, row, update_status=True, force=False):
+        folder = self.downloads_folder
+        if not folder:
+            if update_status:
+                self.preferred_source_status.set('Choose downloads to verify preferred file sources.')
+            return
+        if not preferred_source_candidates(row, self.archives):
+            if update_status:
+                self.preferred_source_status.set('No alternate file sources to resolve for this mod.')
+            return
+        key = self.preferred_key(row)
+        result = self._preferred_cache.get(key)
+        if not force and result and signature(result['path']) == result['signature']:
+            count = len(result['alternatives'])
+            text = f'{count} file(s) verified in the mod archive. Recorded sources remain in file details.' if count else result['message'] or 'No verified source substitutions for this mod.'
+            if update_status:
+                self.preferred_source_status.set(text)
+            return
+        if update_status:
+            self.preferred_source_status.set('Checking the mod archive for equivalent files…')
+        if key in self._preferred_pending:
+            return
+        self._preferred_pending.add(key)
+        if self.activity.owner not in ('sources', 'load'):
+            self.activity.start('sources', 'Checking archive sources', self.cancel_preferred_source_checks)
+            self.set_status('Verifying matching files in the downloads folder…')
+        self._preferred_tasks.put((self._preferred_generation, key, row, folder, list(self.archives)))
+        if not getattr(self, '_preferred_worker', None) or not self._preferred_worker.is_alive():
+            self._preferred_worker = threading.Thread(target=self.preferred_source_worker, daemon=True)
+            self._preferred_worker.start()
+        if not getattr(self, '_preferred_poll_id', None):
+            self._preferred_poll_id = self.root.after(100, self.poll_preferred_sources)
+
+    def poll_preferred_sources(self):
+        self._preferred_poll_id = None
+        refresh = False
+        updated = set()
+        while not self._preferred_events.empty():
+            generation, key, result = self._preferred_events.get_nowait()
+            if generation != self._preferred_generation:
+                continue
+            self._preferred_pending.discard(key)
+            self._preferred_cache[key] = result
+            updated.add(key)
+            refresh |= bool(self.current_selected_row and key == self.preferred_key(self.current_selected_row))
+        for item, row in self.row_by_item_id.items():
+            if self.preferred_key(row) in updated and not row.get('is_separator'):
+                self.tree.set(item, 'sources', self.archive_count_label(row))
+                self.tree.set(item, 'size', self.preferred_row(row).get('size_mb', ''))
+        if refresh:
+            self.on_mod_select(None)
+        if updated:
+            self.update_preferred_source_progress()
+            if not self._preferred_pending:
+                self.autosave_session()
+        if self._preferred_pending and not self._preferred_poll_id:
+            self._preferred_poll_id = self.root.after(100, self.poll_preferred_sources)
+
+    def selected_detail_file(self, origin):
+        tree = self.sources_tree if origin == 'sources' else self.files_tree
+        selection = tree.selection()
+        if not selection:
+            return None
+        if origin == 'sources':
+            return self.row_by_source_item_id.get(selection[0], {}).get('file_info')
+        return self.row_by_file_item_id.get(selection[0])
+
+    def on_file_selection(self, origin):
+        button = self.source_details_button if origin == 'sources' else self.file_details_button
+        button.configure(state=tk.NORMAL if self.selected_detail_file(origin) else tk.DISABLED)
+
+    def clear_file_details(self):
+        self.row_by_source_item_id = {}
+        self.row_by_file_item_id = {}
+        for name in ('source_details_button', 'file_details_button'):
+            if hasattr(self, name):
+                getattr(self, name).configure(state=tk.DISABLED)
+        window = getattr(self, 'file_detail_window', None)
+        if window and window.winfo_exists():
+            window.destroy()
+
+    def show_file_details(self, origin):
+        file_info = self.selected_detail_file(origin)
+        if not file_info:
+            return
+        raw = self.raw_directive_for_file(file_info)
+        groups = archive_contributions(self.preferred_row(self.current_selected_row or {}))
+        group = next((item for item in groups if item['archive'].get('Hash') == file_info.get('archive_hash')), None)
+        archive = group['archive'] if group else None
+        description = describe_directive(file_info, raw, archive, group)
+        model = getattr(self, 'package_model', None)
+        if model and raw and directive_type(raw.get('$type')) == 'CreateBSA':
+            inputs = model.ingredients(raw)
+            description += f'\n\nTemporary input files: {len(inputs):,}'
+            description += ''.join(f'\n{item["To"]}' for item in inputs)
+        raw_text = (json.dumps(raw, indent=2, ensure_ascii=False) if raw is not None else
+                    'The full directive is unavailable in this older snapshot. Open the original Wabbajack package to inspect it.')
+        window = getattr(self, 'file_detail_window', None)
+        if not window or not window.winfo_exists():
+            window = self.file_detail_window = tk.Toplevel(self.root)
+            window.geometry('850x600')
+            notebook = ttk.Notebook(window)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            self.file_detail_text = scrolledtext.ScrolledText(notebook, wrap=tk.WORD, state=tk.DISABLED)
+            self.file_detail_raw = scrolledtext.ScrolledText(notebook, wrap=tk.WORD, state=tk.DISABLED)
+            style_text(self.file_detail_text)
+            self.file_detail_raw.configure(background=COLORS['surface'], foreground=COLORS['text'])
+            notebook.add(self.file_detail_text, text='Installation details')
+            notebook.add(self.file_detail_raw, text='Raw directive JSON')
+            self.copy_directive_button = ttk.Button(window, text='Copy raw directive', command=self.copy_raw_directive)
+            self.copy_directive_button.pack(anchor='w', padx=10, pady=(0, 10))
+        window.title('File details — ' + str(file_info['target_path']).replace('\\', '/').rsplit('/', 1)[-1])
+        for widget, text in ((self.file_detail_text, description), (self.file_detail_raw, raw_text)):
+            widget.configure(state=tk.NORMAL)
+            widget.delete('1.0', tk.END)
+            widget.insert('1.0', text)
+            widget.configure(state=tk.DISABLED)
+        self.copy_directive_button.configure(state=tk.NORMAL if raw is not None else tk.DISABLED)
+        window.lift()
+
+    def copy_raw_directive(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.file_detail_raw.get('1.0', 'end-1c'))
+
+    def on_output_file_activate(self, event):
+        if self.files_tree.identify_region(event.x, event.y) not in ('heading', 'separator'):
+            self.show_file_details('files')
+
+    def clear_mod_details(self):
+        self.current_selected_row = None
+        self.details_title.set('Select a mod')
+        self.clear_file_details()
+        if hasattr(self, 'comparison_detail_text'):
+            self.comparison_detail_text.configure(state=tk.NORMAL)
+            self.comparison_detail_text.delete('1.0', tk.END)
+            self.comparison_detail_text.configure(state=tk.DISABLED)
+            self.open_local_button.configure(state=tk.DISABLED)
+        self.overview_text.delete('1.0', tk.END)
+        self.overview_text.insert('1.0', 'Select a mod to see its details, install instructions and output files.')
+        self.sources_tree.delete(*self.sources_tree.get_children())
+        self.files_tree.delete(*self.files_tree.get_children())
+
+    def open_installed_mod_folder(self):
+        comparison = (self.current_selected_row or {}).get('comparison') or {}
+        folder = comparison.get('local_folder')
+        if folder and Path(folder).is_dir():
+            webbrowser.open(Path(folder).absolute().as_uri())
+
     def on_mod_select(self, event):
         """Handle mod selection and show details."""
         selection = self.tree.selection()
         if not selection:
+            self.clear_mod_details()
             return
 
         row = self.row_by_item_id.get(selection[0])
         if not row:
             return
 
+        details_tab = self.notebook.select()
         self.current_selected_row = row
+        self.details_title.set(row['name'])
+        self.clear_file_details()
+        self.request_preferred_source_check(row)
+        display_row = self.preferred_row(row)
+        self.tree.set(selection[0], 'sources', self.archive_count_label(row))
+        self.tree.set(selection[0], 'size', display_row.get('size_mb', ''))
+
+        comparison = row.get('comparison')
+        if hasattr(self, 'comparison_detail_text'):
+            from comparison_ui import format_comparison_details
+            self.comparison_detail_text.configure(state=tk.NORMAL)
+            self.comparison_detail_text.delete('1.0', tk.END)
+            self.comparison_detail_text.insert('1.0', format_comparison_details(comparison) if comparison else 'Separators and unmanaged game entries are not compared.')
+            self.comparison_detail_text.configure(state=tk.DISABLED)
+            self.open_local_button.configure(state=tk.NORMAL if comparison and comparison.get('local_folder') and comparison['local_present'] else tk.DISABLED)
+
+        if row.get('installed_only'):
+            self.overview_text.delete('1.0', tk.END)
+            self.overview_text.insert('1.0', 'This mod is listed in your installed profile and has no confirmed match in the selected Wabbajack profile.\n\n' + format_comparison_details(comparison))
+            self.update_sources_tab(row)
+            self.files_tree.delete(*self.files_tree.get_children())
+            self.files_tree.insert('', 'end', text='Use Open installed mod folder to inspect its files and meta.ini.')
+            self.notebook.select(self.comparison_detail_frame)
+            return
 
         self.overview_text.delete(1.0, tk.END)
+        if not self.active_profile and row.get('archive'):
+            archive = row['archive']
+            links = self.build_archive_links(archive)
+            overview = f"Download archive: {archive.get('Name', row['name'])}\nSize: {archive.get('Size', 0):,} bytes\n"
+            overview += '\nNo authored mod profile is available; this is a download record.\n'
+            overview += '\n'.join(link for link in links.values() if link)
+            self.overview_text.insert('1.0', overview)
+            self.make_links_clickable()
+            self.sources_tree.delete(*self.sources_tree.get_children())
+            self.files_tree.delete(*self.files_tree.get_children())
+            self.files_tree.insert('', 'end', text='File mappings are available for authored mod profiles only.')
+            self.notebook.select(0)
+            return
 
         if row["is_separator"]:
             overview = (
@@ -2921,25 +3294,11 @@ class WabbajackGuideApp:
             self.notebook.select(0)
             return
 
-        if row.get("external_only"):
-            overview = (
-                f"Mod Name: {row['name']}\n"
-                f"Order: {row['number']}\n"
-                "\n"
-                "This mod exists in the external modlist but not in the loaded Wabbajack modlist."
-            )
-            self.overview_text.insert(1.0, overview)
-            self.update_sources_tab(row)
-            self.files_tree.delete(*self.files_tree.get_children())
-            self.files_tree.insert("", "end", text="No file details available for external-only entries.")
-            self.notebook.select(0)
-            return
-
         archive = row.get("archive")
         folder_meta = row.get("folder_meta", {})
-        source_archives = row.get("source_archives", [])
+        source_archives = display_row.get("source_archives", [])
 
-        if not archive and not folder_meta and not source_archives:
+        if not archive and not folder_meta and not source_archives and not row.get("folder_files"):
             overview = (
                 f"Mod Name: {row['name']}\n"
                 f"Order: {row['number']}\n"
@@ -2960,26 +3319,28 @@ class WabbajackGuideApp:
         mod_description = state.get("Description", "") if archive else ""
         mod_version = folder_meta.get("version") or state.get("Version", "")
         actual_mod_name = state.get("Name", filename) if archive else row["raw_name"]
-        total_archive_size = sum(source_archive.get("Size", 0) for source_archive in source_archives)
+        embedded_sources = [item for item in source_archives if str(item.get('Hash', '')).startswith(self.INLINE_SOURCE_PREFIX)]
+        game_sources = [item for item in source_archives if downloader_type(item.get('State', {}).get('$type')) == 'GameFileSource']
+        download_archives = [item for item in source_archives if item not in embedded_sources and item not in game_sources]
+        total_archive_size = sum(item.get('Size', 0) for item in download_archives)
 
-        overview = f"Mod Folder: {row['raw_name']}\n"
-        overview += f"Display Name: {row['name']}\n"
+        active_label = self.get_activation_label_for_row(row)
+        active_label = {'Yes': 'Active', 'No': 'Inactive'}.get(active_label, active_label)
+        overview = ' · '.join(str(value) for value in (mod_author, mod_version, active_label) if value) + '\n'
+        overview += f"Installation archive: {filename}\n"
+        seen_names = {row['name'], filename}
+        for label, value in (('Mod folder', row['raw_name']), ('Archive identity', actual_mod_name)):
+            if value and value not in seen_names:
+                overview += f"{label}: {value}\n"
+                seen_names.add(value)
         overview += f"Order: {row['number']}\n"
-        overview += f"Active: {self.get_activation_label_for_row(row)}\n"
-        overview += f"Primary Source: {actual_mod_name}\n"
-        overview += f"Installation File (meta.ini): {filename}\n"
-        if installation_file_meta:
-            overview += "Note: meta.ini installation file is metadata and is not counted as a source archive.\n"
-        overview += f"Author: {mod_author}\n"
-        if mod_version:
-            overview += f"Version: {mod_version}\n"
         if folder_meta.get("repository"):
             overview += f"Repository: {folder_meta['repository']}\n"
         if folder_meta.get("modid"):
             overview += f"Mod ID: {folder_meta['modid']}\n"
 
         size_mb = total_archive_size / (1024 * 1024) if total_archive_size > 0 else 0
-        overview += f"Source Archive Size: {size_mb:.1f} MB\n\n"
+        overview += f"Combined archive download size: {size_mb:.1f} MiB\n\n"
 
         if mod_description:
             overview += f"Description: {mod_description}\n\n"
@@ -2988,23 +3349,46 @@ class WabbajackGuideApp:
             direct_links_total = sum(
                 1 for source_archive in source_archives if self.build_archive_links(source_archive)["download"]
             )
-            source_file_counts = row.get("source_file_counts", {})
+            contributions = archive_contributions(display_row)
+            auxiliary_count = sum(group['auxiliary_empty'] for group in contributions)
             overview += f"Direct Links Available: {direct_links_total}\n"
-            overview += f"Sources: {len(source_archives)}\n\n"
+            preferred_count = sum('preferred_source' in item for item in display_row.get('folder_files', []))
+            archive_label = 'Preferred download archives' if preferred_count else 'Download archives used'
+            overview += f"{archive_label}: {len(download_archives)}\n"
+            verification = self._preferred_cache.get(self.preferred_key(row))
+            if verification and verification.get('message'):
+                overview += 'Source verification is incomplete; recorded archive mappings are shown.\n'
+            if preferred_count:
+                overview += f"Verified equivalent files shown under the mod archive: {preferred_count}\n"
+                overview += 'Source groups use verified equivalents. File details and exports retain the recorded Wabbajack mapping.\n'
+            if embedded_sources:
+                overview += f"Embedded package file groups: {len(embedded_sources)}\n"
+            if game_sources:
+                overview += f"Game file sources used: {len(game_sources)}\n"
+            if auxiliary_count:
+                overview += f"Archives supplying only empty files: {auxiliary_count}\n"
+                overview += ('Wabbajack can select identical empty files from other downloads. '
+                             'These archive references do not establish mod dependencies.\n'
+                             'Empty-file groups are collapsed in Install Instructions; search expands matching groups.\n')
+            if any(group['role'] == 'Recorded extraction source' for group in contributions):
+                overview += ('Source titles are recorded metadata. These archive references describe extraction '
+                             'locations and do not establish mod dependencies.\n')
+            overview += '\n'
             for index, source_archive in enumerate(source_archives, start=1):
                 source_state = source_archive.get("State", {})
                 links = self.build_archive_links(source_archive)
                 source_name = source_state.get("Name") or source_archive.get("Name", "Unknown")
-                file_count = source_file_counts.get(source_archive.get("Hash", ""), 0)
-                overview += f"Source {index}: {source_name}\n"
-                overview += f"Files Contributed: {file_count}\n"
-                overview += f"Archive File (directive->Archives.Name): {source_archive.get('Name', '')}\n"
+                group = next(item for item in contributions if item['archive'] is source_archive)
+                overview += f"Archive {index} (recorded title): {source_name}\n"
+                overview += f"Role: {group['role']}\n"
+                overview += f"Contribution: {contribution_summary(group)}\n"
+                overview += f"Archive filename: {source_archive.get('Name', '')}\n"
                 if source_archive.get("Hash"):
                     overview += f"Archive Hash: {source_archive.get('Hash')}\n"
                 if source_state.get("$type"):
                     overview += f"Archive State Type: {source_state.get('$type')}\n"
                 if source_state.get("Version"):
-                    overview += f"Source Version: {source_state.get('Version')}\n"
+                    overview += f"Archive Version: {source_state.get('Version')}\n"
                 if links["page"]:
                     overview += f"Mod Page: {links['page']}\n"
                 if links["download"]:
@@ -3017,7 +3401,10 @@ class WabbajackGuideApp:
         if file_list:
             overview += f"Files to be installed: {len(file_list)} files\n"
             total_size = sum(file_info["size"] for file_info in file_list)
-            overview += f"Total file size: {total_size:,} bytes ({total_size / (1024 * 1024):.1f} MB)\n"
+            overview += f"Known declared file size: {total_size:,} bytes ({total_size / (1024 * 1024):.1f} MiB)\n"
+            generated_unknown = sum(file_info.get("directive_type") == "CreateBSA" and not file_info.get("size") for file_info in file_list)
+            if generated_unknown:
+                overview += f"Generated archives with unknown final size: {generated_unknown}\n"
         else:
             overview += "No file details available for this mod.\n"
 
@@ -3026,7 +3413,7 @@ class WabbajackGuideApp:
 
         self.update_sources_tab(row)
         self.update_files_tab(row)
-        self.notebook.select(0)
+        self.notebook.select(details_tab or 0)
 
     def open_link(self, event):
         """Open link in default browser."""
@@ -3070,6 +3457,9 @@ class WabbajackGuideApp:
                 "target_path": target_path,
                 "archive_path": archive_path,
                 "source_mod": file_info.get("source_mod", "Unknown"),
+                "kind": file_info.get("directive_type", ""),
+                "hash": file_info.get("hash", ""),
+                "file_info": file_info,
             }
 
         return tree
@@ -3078,23 +3468,29 @@ class WabbajackGuideApp:
         """Recursively populate the files treeview."""
         for name, item in file_tree.items():
             if item["type"] == "dir":
-                dir_id = self.files_tree.insert(parent, "end", text=f"[DIR] {name}/", values=("", "", ""), tags=("directory",))
+                dir_id = self.files_tree.insert(parent, "end", text=f"{name}/", values=("", "", "", "", ""), tags=("directory",))
                 self.populate_files_tree(item["children"], dir_id)
             else:
                 size_str = f"{item['size']:,}" if item["size"] > 0 else "0"
+                if item.get("kind") == "CreateBSA" and not item["size"]:
+                    size_str = "Unknown"
                 source_mod = item.get("source_mod", "Unknown")
                 source_path = item.get("archive_path", "Unknown")
-                self.files_tree.insert(
+                item_id = self.files_tree.insert(
                     parent,
                     "end",
-                    text=f"[FILE] {name}",
-                    values=(source_mod, source_path, size_str),
+                    text=name,
+                    values=(source_mod, source_path, size_str, item.get("kind", ""), item.get("hash") or "Unknown"),
                     tags=("file",),
                 )
+                self.row_by_file_item_id[item_id] = item['file_info']
 
     def update_files_tab(self, row):
         """Update the files tab with organized file tree."""
+        row = self.preferred_row(row)
         self.files_tree.delete(*self.files_tree.get_children())
+        self.row_by_file_item_id = {}
+        self.file_details_button.configure(state=tk.DISABLED)
 
         file_list = row.get("folder_files", [])
         source_names = {
@@ -3111,13 +3507,16 @@ class WabbajackGuideApp:
             if hide_mohidden and self.is_mohidden_file(file_info):
                 continue
             enriched = dict(file_info)
-            enriched["source_mod"] = source_names.get(file_info.get("archive_hash", ""), "Unknown")
+            fallback_source = "Generated archive" if file_info.get("directive_type") == "CreateBSA" else "Unknown"
+            enriched["source_mod"] = source_names.get(file_info.get("archive_hash", ""), fallback_source)
             if search_text:
                 haystack = " ".join(
                     [
                         str(enriched.get("target_path", "")),
                         str(enriched.get("archive_path", "")),
                         str(enriched.get("source_mod", "")),
+                        str(enriched.get("directive_type", "")),
+                        str(enriched.get("hash", "")),
                     ]
                 ).lower()
                 if search_text not in haystack:
@@ -3131,6 +3530,8 @@ class WabbajackGuideApp:
             self.populate_files_tree(file_tree)
         else:
             self.files_tree.insert("", "end", text="No file details available for this mod.")
+        if hasattr(self, 'file_columns'):
+            self.file_columns.configure('files', data=self.file_columns.tree_data())
 
     def make_links_clickable(self):
         """Make URLs in the text widget clickable."""
@@ -3144,49 +3545,39 @@ class WabbajackGuideApp:
                 self.overview_text.tag_add("link", start, end)
 
     def update_sources_tab(self, row):
-        """Populate sources tab with per-source file installs for the selected mod folder."""
+        """Show recorded instructions by archive, distinguishing empty-only contributions."""
+        row = self.preferred_row(row)
         self.sources_tree.delete(*self.sources_tree.get_children())
         self.row_by_source_item_id = {}
+        self.source_details_button.configure(state=tk.DISABLED)
 
         if row.get("is_separator"):
-            self.sources_tree.insert("", "end", text="No sources for separators.")
+            self.sources_tree.insert("", "end", text="No install instructions for separators.")
             return
 
-        source_archives = list(row.get("source_archives", []))
-        if not source_archives:
-            self.sources_tree.insert("", "end", text="No source archives available.")
+        source_groups = archive_contributions(row)
+        if not source_groups:
+            self.sources_tree.insert("", "end", text="No install instructions available.")
             return
 
         folder_name = row.get("raw_name", "")
         folder_prefix = f"mods\\{folder_name}\\"
         search_text = self.sources_search_var.get().lower().strip() if hasattr(self, "sources_search_var") else ""
-        files_by_archive = {}
         hide_mohidden = bool(
             hasattr(self, "sources_hide_mohidden_var") and self.sources_hide_mohidden_var.get()
         )
-        for file_info in row.get("folder_files", []):
-            if hide_mohidden and self.is_mohidden_file(file_info):
-                continue
-            archive_hash = file_info.get("archive_hash", "")
-            files_by_archive.setdefault(archive_hash, []).append(file_info)
-
-        source_groups = []
-        for source_archive in source_archives:
-            archive_hash = source_archive.get("Hash", "")
-            source_files = files_by_archive.get(archive_hash, [])
-            source_groups.append((source_archive, source_files))
-
         source_groups.sort(
-            key=lambda item: self.get_source_sort_value(item[0], item[1], self.sources_sort_column),
+            key=lambda group: self.get_source_sort_value(group['archive'], group['files'], self.sources_sort_column),
             reverse=self.sources_sort_reverse,
         )
+        source_groups.sort(key=lambda group: (group['auxiliary_empty'], not group['primary']))
 
-        for index, (source_archive, source_files) in enumerate(source_groups, start=1):
-            source_state = source_archive.get("State", {})
+        for group in source_groups:
+            source_archive = group['archive']
             links = self.build_archive_links(source_archive)
             source_name = self.get_source_archive_label(source_archive)
-            archive_hash = source_archive.get("Hash", "")
-            source_files = self.sort_files_for_column(list(source_files))
+            source_files = self.sort_files_for_column([
+                item for item in group['files'] if not (hide_mohidden and self.is_mohidden_file(item))])
 
             if search_text:
                 matched_files = []
@@ -3196,6 +3587,8 @@ class WabbajackGuideApp:
                             str(file_info.get("target_path", "")),
                             str(file_info.get("archive_path", "")),
                             str(source_name),
+                            str(source_archive.get('Name', '')),
+                            group['role'],
                             str(file_info.get("directive_type", "")),
                         ]
                     ).lower()
@@ -3203,11 +3596,11 @@ class WabbajackGuideApp:
                         matched_files.append(file_info)
                 source_files = matched_files
 
-            if search_text and not source_files:
+            if (search_text or hide_mohidden) and not source_files:
                 continue
 
-            parent_text = f"Source {index}: {source_name} ({len(source_files)} files)"
-            item_id = self.sources_tree.insert("", "end", text=parent_text, values=("", "", "", ""))
+            parent_text = f"{source_name} — {group['role']} ({contribution_summary(group, source_files)})"
+            item_id = self.sources_tree.insert("", "end", text=parent_text, values=(source_archive.get('Name', ''), "", "", "", ""))
             self.row_by_source_item_id[item_id] = {"archive": source_archive, "links": links}
 
             for file_info in source_files:
@@ -3217,28 +3610,37 @@ class WabbajackGuideApp:
                 else:
                     install_path = target_path
 
-                self.sources_tree.insert(
+                file_id = self.sources_tree.insert(
                     item_id,
                     "end",
                     text="",
                     values=(
+                        '',
                         install_path,
                         file_info.get("archive_path", ""),
-                        f"{file_info.get('size', 0):,}",
+                        "Unknown" if file_info.get("directive_type") == "CreateBSA" and not file_info.get("size") else f"{file_info.get('size', 0):,}",
                         file_info.get("directive_type", ""),
                     ),
                 )
+                self.row_by_source_item_id[file_id] = {'file_info': file_info, 'archive': source_archive, 'links': links}
 
-            self.sources_tree.item(item_id, open=True)
+            self.sources_tree.item(item_id, open=bool(search_text) or not group['auxiliary_empty'])
+        if hasattr(self, 'source_columns'):
+            self.source_columns.configure('sources', data=self.source_columns.tree_data())
 
     def on_source_activate(self, event):
-        """Open the most useful link for the selected source archive."""
+        """Inspect a file, or open the selected archive's source page."""
+        if self.sources_tree.identify_region(event.x, event.y) in ('heading', 'separator'):
+            return
         selection = self.sources_tree.selection()
         if not selection:
             return
 
         source_row = self.row_by_source_item_id.get(selection[0])
         if not source_row:
+            return
+        if source_row.get('file_info'):
+            self.show_file_details('sources')
             return
 
         links = source_row.get("links", {})
@@ -3248,7 +3650,34 @@ class WabbajackGuideApp:
 
 
 
-def main():
+def reset_stored_state():
+    """Remove disposable app state without touching user snapshots or profiles."""
+    from hash_cache import default_cache_path
+
+    viewer_dir = Path(__file__).parent
+    paths = [viewer_dir / name for name in (
+        'wabbajack_viewer.config.json',
+        'wabbajack_comparison.config.json',
+        'wabbajack_copy.config.json',
+        'wabbajack_session.wvmodlist.json.gz',
+    )]
+    cache = default_cache_path()
+    paths.extend(Path(str(cache) + suffix) for suffix in ('', '-wal', '-shm', '-journal'))
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Browse Wabbajack mod lists and compare installed profiles.')
+    parser.add_argument('--clean', action='store_true',
+                        help='delete saved session, all app preferences and file-hash cache before launching; '
+                             'close other viewer windows first')
+    args = parser.parse_args(argv)
+    if args.clean:
+        try:
+            reset_stored_state()
+        except OSError as exc:
+            parser.exit(1, f'Could not clear stored app state: {exc}\n')
     root = tk.Tk()
     app = WabbajackGuideApp(root)
     root.mainloop()

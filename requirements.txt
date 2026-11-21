@@ -14,7 +14,8 @@
 pyinstaller>=5.0.0
 
 # Python version requirement
-# This script requires Python 3.6+ for f-string support and other modern features
+# This application requires Python 3.9+ and tkinter.
+# Optional file verification uses the system libxxhash library via ctypes.
 
 # Note: tkinter is included with most Python installations
 # If tkinter is not available, install it with:

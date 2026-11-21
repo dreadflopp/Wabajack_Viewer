@@ -9,8 +9,13 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
@@ -27,15 +32,16 @@ ENV/
 Thumbs.db
 
 # Wabbajack files and extracted contents
+*.wabbajack
 wabbajack_files/
 
-# Helper scripts
-extract_wabbajack.py
-
-# temp files
-_temp_modlist.json
-wabbajack_viewer.config.json
+# Local preferences and saved viewer snapshots
+wabbajack_*.config.json
+*.wvmodlist.json.gz
+*.wvjcache.json.gz
+# Interrupted atomic snapshot writes
+*.wvmodlist.json.gz.*.tmp
+*.wvjcache.json.gz.*.tmp
 
 # generated exports
 exports/
-export_install_instructions.py
