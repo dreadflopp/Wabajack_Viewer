@@ -9,15 +9,16 @@ jobs:
   build-and-release:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-        python-version: [3.11]  # Use latest stable Python
+        os: [windows-latest, ubuntu-24.04, macos-15-intel]
+        python-version: ['3.11']
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
     
@@ -32,21 +33,21 @@ jobs:
     
     - name: Upload Windows executable
       if: matrix.os == 'windows-latest'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: WabbajackViewer-Windows
         path: dist/WabbajackViewer.exe
     
     - name: Upload Linux executable
-      if: matrix.os == 'ubuntu-latest'
-      uses: actions/upload-artifact@v4
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@v7
       with:
         name: WabbajackViewer-Linux
         path: dist/WabbajackViewer
     
     - name: Upload macOS executable
-      if: matrix.os == 'macos-latest'
-      uses: actions/upload-artifact@v4
+      if: runner.os == 'macOS'
+      uses: actions/upload-artifact@v7
       with:
         name: WabbajackViewer-macOS
         path: dist/WabbajackViewer
@@ -59,36 +60,26 @@ jobs:
     
     steps:
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
+      with:
+        path: artifacts
     
     - name: Prepare release files
       run: |
         mkdir -p release-files
-        # Copy all executables
-        find . -name "*.exe" -exec cp {} release-files/ \;
-        find . -name "WabbajackViewer" -not -name "*.exe" -exec cp {} release-files/ \;
-        
-        # Rename for clarity
-        cd release-files
-        for file in *; do
-          if [[ "$file" == "WabbajackViewer.exe" ]]; then
-            mv "$file" "WabbajackViewer-Windows.exe"
-          elif [[ "$file" == "WabbajackViewer" ]]; then
-            # Determine if it's Linux or macOS based on the artifact name
-            if [[ -f "../WabbajackViewer-Linux/WabbajackViewer" ]]; then
-              mv "$file" "WabbajackViewer-Linux"
-            else
-              mv "$file" "WabbajackViewer-macOS"
-            fi
-          fi
+        cp artifacts/WabbajackViewer-Windows/WabbajackViewer.exe release-files/WabbajackViewer-Windows.exe
+        for platform in Linux macOS; do
+          cp "artifacts/WabbajackViewer-$platform/WabbajackViewer" "release-files/WabbajackViewer-$platform"
+          chmod +x "release-files/WabbajackViewer-$platform"
         done
         
         # Create a zip with all files
+        cd release-files
         zip -r WabbajackViewer-All-Platforms.zip *
         ls -la
     
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: |
           release-files/*

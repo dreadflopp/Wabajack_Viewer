@@ -12,15 +12,18 @@ jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-        python-version: [3.9, 3.10, 3.11]
+        # Python 3.9 is unavailable on newer Ubuntu and macOS arm64 runners.
+        os: [windows-latest, ubuntu-24.04, macos-15-intel]
+        # Quote versions so YAML does not turn 3.10 into 3.1.
+        python-version: ['3.9', '3.10', '3.11']
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
     
@@ -35,21 +38,21 @@ jobs:
     
     - name: Upload Windows executable
       if: matrix.os == 'windows-latest'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: WabbajackViewer-Windows-${{ matrix.python-version }}
         path: dist/WabbajackViewer.exe
     
     - name: Upload Linux executable
-      if: matrix.os == 'ubuntu-latest'
-      uses: actions/upload-artifact@v4
+      if: runner.os == 'Linux'
+      uses: actions/upload-artifact@v7
       with:
         name: WabbajackViewer-Linux-${{ matrix.python-version }}
         path: dist/WabbajackViewer
     
     - name: Upload macOS executable
-      if: matrix.os == 'macos-latest'
-      uses: actions/upload-artifact@v4
+      if: runner.os == 'macOS'
+      uses: actions/upload-artifact@v7
       with:
         name: WabbajackViewer-macOS-${{ matrix.python-version }}
         path: dist/WabbajackViewer
@@ -63,40 +66,35 @@ jobs:
     
     steps:
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
+      with:
+        path: artifacts
     
     - name: Prepare Release Assets
       run: |
         mkdir -p release-assets
-        # Copy Windows executables
-        find . -name "WabbajackViewer-Windows-*.exe" -exec cp {} release-assets/ \;
-        # Copy Linux executables
-        find . -name "WabbajackViewer-Linux-*" -not -name "*.exe" -exec cp {} release-assets/ \;
-        # Copy macOS executables
-        find . -name "WabbajackViewer-macOS-*" -not -name "*.exe" -exec cp {} release-assets/ \;
-        
-        # Rename files for clarity
-        cd release-assets
-        for file in *; do
-          if [[ "$file" == WabbajackViewer-Windows-* ]]; then
-            new_name="WabbajackViewer-Windows-${file#WabbajackViewer-Windows-}"
-            mv "$file" "$new_name"
-          elif [[ "$file" == WabbajackViewer-Linux-* ]]; then
-            new_name="WabbajackViewer-Linux-${file#WabbajackViewer-Linux-}"
-            mv "$file" "$new_name"
-          elif [[ "$file" == WabbajackViewer-macOS-* ]]; then
-            new_name="WabbajackViewer-macOS-${file#WabbajackViewer-macOS-}"
-            mv "$file" "$new_name"
-          fi
+        # Artifact directories carry the platform/version; filenames do not.
+        for artifact in artifacts/WabbajackViewer-*; do
+          name="$(basename "$artifact")"
+          case "$name" in
+            WabbajackViewer-Windows-*)
+              cp "$artifact/WabbajackViewer.exe" "release-assets/$name.exe"
+              ;;
+            WabbajackViewer-Linux-*|WabbajackViewer-macOS-*)
+              cp "$artifact/WabbajackViewer" "release-assets/$name"
+              chmod +x "release-assets/$name"
+              ;;
+          esac
         done
         
         # Create a zip file with all executables
+        cd release-assets
         zip -r WabbajackViewer-All-Platforms.zip *
         
         ls -la
     
     - name: Upload Release Assets
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: |
           release-assets/*.exe
